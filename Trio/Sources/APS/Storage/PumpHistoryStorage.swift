@@ -1,0 +1,702 @@
+import Combine
+import CoreData
+import Foundation
+import LoopKit
+import SwiftDate
+import Swinject
+
+protocol PumpHistoryObserver {
+    func pumpHistoryDidUpdate(_ events: [PumpHistoryEvent])
+}
+
+protocol PumpHistoryStorage {
+    var updatePublisher: AnyPublisher<Void, Never> { get }
+    func getPumpHistory() async throws -> [PumpHistoryEvent]
+    /// Returns the ids of purged events that were already uploaded to NS,
+    /// so the caller can delete the now-withdrawn treatments remotely.
+    @discardableResult func storePumpEvents(_ events: [NewPumpEvent], replacePendingEvents: Bool) async throws -> [String]
+    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async
+    func getPumpHistoryNotYetUploadedToNightscout() async throws -> [NightscoutTreatment]
+    func getPumpHistoryNotYetUploadedToHealth() async throws -> [PumpHistoryEvent]
+    func getPumpHistoryNotYetUploadedToTidepool() async throws -> [PumpHistoryEvent]
+}
+
+final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
+    private let processQueue = DispatchQueue(label: "BasePumpHistoryStorage.processQueue")
+    @Injected() var storage: FileStorage!
+    @Injected() private var broadcaster: Broadcaster!
+    @Injected() private var settings: SettingsManager!
+
+    let updateSubject = PassthroughSubject<Void, Never>()
+
+    var updatePublisher: AnyPublisher<Void, Never> {
+        updateSubject.eraseToAnyPublisher()
+    }
+
+    let makeContext: () -> NSManagedObjectContext
+
+    init(resolver: Resolver, contextProvider: (() -> NSManagedObjectContext)? = nil) {
+        makeContext = contextProvider ?? { CoreDataStack.shared.newTaskContext() }
+        injectServices(resolver)
+    }
+
+    typealias PumpEvent = PumpEventStored.EventType
+    typealias TempType = PumpEventStored.TempType
+
+    private func roundDose(_ dose: Double, toIncrement increment: Double) -> Decimal {
+        let roundedValue = (dose / increment).rounded() * increment
+        return Decimal(roundedValue)
+    }
+
+    /// Dose-time snapshot of the active insulin model; never revised on finalization.
+    private func applyInsulinSnapshot(to event: PumpEventStored, insulinType: InsulinType?) {
+        let preferences = settings.preferences
+        event.insulinType = insulinType?.identifier
+        event.actionDuration = settings.pumpSettings.insulinActionCurve as NSDecimalNumber
+        event.peakTime = IobCalculation.lookupPeak(
+            curve: preferences.curve,
+            useCustomPeakTime: preferences.useCustomPeakTime,
+            insulinPeakTime: preferences.insulinPeakTime
+        ).map { Decimal($0) as NSDecimalNumber }
+    }
+
+    @discardableResult func storePumpEvents(_ events: [NewPumpEvent], replacePendingEvents: Bool) async throws -> [String] {
+        let context = makeContext()
+        context.name = "storePumpEvents"
+        // on constraint conflicts the persisted row wins: finalized rows never change
+        context.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
+        return try await context.perform {
+            // upsert candidates: dose syncIdentifier, timestamp+type as fallback
+            // LoopKit derives dose.syncIdentifier from raw; empty raw must not become a shared identity
+            let syncIdentifiers = events.compactMap(\.dose?.syncIdentifier).filter { !$0.isEmpty }
+            let timestamps = events.map(\.date)
+            let request = PumpEventStored.fetchRequest() as NSFetchRequest<PumpEventStored>
+            request.predicate = NSCompoundPredicate(orPredicateWithSubpredicates: [
+                NSPredicate(format: "syncIdentifier IN %@", syncIdentifiers),
+                NSPredicate(format: "timestamp IN %@", timestamps)
+            ])
+            request.relationshipKeyPathsForPrefetching = ["tempBasal"]
+            let existingRows = try context.fetch(request)
+
+            var bySyncIdentifier = Dictionary(
+                existingRows.compactMap { row in row.syncIdentifier.map { ($0, row) } },
+                uniquingKeysWith: { first, _ in first }
+            )
+            var byTimestampAndType = Dictionary(
+                existingRows.map { row in
+                    (
+                        TimestampAndType(
+                            timestamp: row.timestamp ?? .distantPast,
+                            type: row.type ?? "",
+                            isScheduledBasal: row.tempBasal?.isScheduledBasal ?? false
+                        ),
+                        row
+                    )
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
+
+            var assertedRows = Set<NSManagedObjectID>()
+
+            for event in events {
+                guard let storedType = event.type?.storedEventType else { continue }
+
+                // Type-aware key: same-timestamp bolus + TBR no longer shadow each other. Scheduled
+                // basal needs its own dimension on top, because it also stores as a TBR row and a
+                // pump cancelling a temp basal reports both at the very same second — Medtronic
+                // resumes the schedule the instant a temp ends. Without this a schedule report
+                // hijacks the still-mutable cancel row and inherits its non-scheduled identity.
+                let fallbackKey = TimestampAndType(
+                    timestamp: event.date,
+                    type: storedType.rawValue,
+                    isScheduledBasal: event.type == .basal
+                )
+                let syncIdentifier = event.dose?.syncIdentifier.flatMap { $0.isEmpty ? nil : $0 }
+                let match = syncIdentifier.flatMap { bySyncIdentifier[$0] }
+                    ?? byTimestampAndType[fallbackKey]
+
+                if let match = match {
+                    assertedRows.insert(match.objectID)
+                    // finalized rows never change
+                    if match.isMutable, let dose = event.dose {
+                        self.updateMutablePumpEvent(match, with: dose)
+                    }
+                    continue
+                }
+
+                let newPumpEvent = PumpEventStored(context: context)
+                newPumpEvent.id = UUID().uuidString
+                // restrict entry to now or past
+                newPumpEvent.timestamp = min(event.date, Date())
+                newPumpEvent.type = storedType.rawValue
+                newPumpEvent.syncIdentifier = syncIdentifier
+                newPumpEvent.isMutable = event.dose?.isMutable ?? false
+                newPumpEvent.isUploadedToNS = false
+                newPumpEvent.isUploadedToHealth = false
+                newPumpEvent.isUploadedToTidepool = false
+                if let dose = event.dose {
+                    self.applyInsulinSnapshot(to: newPumpEvent, insulinType: dose.insulinType)
+                }
+
+                switch storedType {
+                case .bolus:
+                    guard let dose = event.dose else {
+                        context.delete(newPumpEvent)
+                        continue
+                    }
+                    let newBolusEntry = BolusStored(context: context)
+                    newBolusEntry.pumpEvent = newPumpEvent
+                    newBolusEntry.amount = NSDecimalNumber(decimal: self.roundDose(
+                        dose.unitsInDeliverableIncrements,
+                        toIncrement: Double(self.settings.preferences.bolusIncrement)
+                    ))
+                    newBolusEntry.programmedAmount = NSDecimalNumber(decimal: self.roundDose(
+                        dose.programmedUnits,
+                        toIncrement: Double(self.settings.preferences.bolusIncrement)
+                    ))
+                    newBolusEntry.isExternal = dose.manuallyEntered
+                    newBolusEntry.isSMB = dose.automatic ?? true
+
+                case .tempBasal:
+                    guard let dose = event.dose else {
+                        context.delete(newPumpEvent)
+                        continue
+                    }
+                    let newTempBasal = TempBasalStored(context: context)
+                    let isScheduledBasal = event.type == .basal
+                    let span = Self.storedSpan(of: dose, isScheduledBasal: isScheduledBasal)
+                    newTempBasal.pumpEvent = newPumpEvent
+                    newTempBasal.duration = span.duration
+                    newTempBasal.rate = Decimal(dose.unitsPerHour) as NSDecimalNumber
+                    newTempBasal.startDate = span.start
+                    newTempBasal.endDate = span.end
+                    newTempBasal.deliveredUnits = dose.deliveredUnits.map { Decimal($0) as NSDecimalNumber }
+                    newTempBasal.tempType = TempType.absolute.rawValue
+                    newTempBasal.isScheduledBasal = isScheduledBasal
+
+                case .pumpAlarm:
+                    newPumpEvent.note = event.title
+
+                default:
+                    break
+                }
+
+                // same-batch dedup
+                if let syncIdentifier = newPumpEvent.syncIdentifier {
+                    bySyncIdentifier[syncIdentifier] = newPumpEvent
+                }
+                byTimestampAndType[fallbackKey] = newPumpEvent
+                assertedRows.insert(newPumpEvent.objectID)
+            }
+
+            // Mutable rows are the pump's assertions (LoopKit contract): a
+            // complete pending report supersedes any it no longer contains.
+            var purgedUploadedIds: [String] = []
+            if replacePendingEvents {
+                let request = PumpEventStored.fetchRequest() as NSFetchRequest<PumpEventStored>
+                request.predicate = NSPredicate(format: "isMutable == YES")
+                for orphan in try context.fetch(request) where !assertedRows.contains(orphan.objectID) {
+                    debug(
+                        .coreData,
+                        "Purging unasserted mutable event \(orphan.syncIdentifier ?? orphan.id ?? "-") (\(orphan.type ?? "?")), uploaded to NS: \(orphan.isUploadedToNS)"
+                    )
+                    if orphan.isUploadedToNS, let id = orphan.id {
+                        purgedUploadedIds.append(id)
+                    }
+                    context.delete(orphan)
+                }
+            }
+
+            do {
+                guard context.hasChanges else { return purgedUploadedIds }
+                try context.save()
+
+                self.updateSubject.send(())
+                debug(.coreData, "\(DebuggingIdentifiers.succeeded) stored pump events in Core Data")
+            } catch let error as NSError {
+                debug(.coreData, "\(DebuggingIdentifiers.failed) failed to store pump events with error: \(error.userInfo)")
+                throw error
+            }
+            return purgedUploadedIds
+        }
+    }
+
+    /// Span to persist for a basal dose.
+    ///
+    /// A pump-reported scheduled basal has no end: the pump asserts a rate that runs until
+    /// something supersedes it. Drivers spell that differently — DanaKit, MedtrumKit and
+    /// TandemKit report a zero-length dose, MinimedKit a 24 h placeholder whose "true duration
+    /// will be reconciled against other entries" (MinimedKit `DoseStore.swift`). Neither is a
+    /// delivery span, so scheduled basal is stored open-ended and consumers resolve it against
+    /// the next event.
+    private static func storedSpan(
+        of dose: DoseEntry,
+        isScheduledBasal: Bool
+    ) -> (duration: Int16, start: Date, end: Date) {
+        guard !isScheduledBasal else { return (0, dose.startDate, dose.startDate) }
+        return (
+            Int16(round((dose.endDate - dose.startDate).timeInterval / 60)),
+            dose.startDate,
+            dose.endDate
+        )
+    }
+
+    /// Finalized reports freeze the row with delivered values. If NS-visible
+    /// values changed on an already-uploaded row, the upload flag resets and
+    /// the re-POST replaces the NS document in place.
+    private func updateMutablePumpEvent(_ event: PumpEventStored, with dose: DoseEntry) {
+        switch event.type {
+        case PumpEventStored.EventType.bolus.rawValue:
+            guard let bolus = event.bolus else { return }
+            let previousAmount = bolus.amount
+            let finalAmount = dose.deliveredUnits.map {
+                self.roundDose($0, toIncrement: Double(settings.preferences.bolusIncrement))
+            }
+            if let finalAmount = finalAmount {
+                bolus.amount = finalAmount as NSDecimalNumber
+            }
+            bolus.isSMB = dose.automatic ?? true
+            event.isMutable = dose.isMutable
+            if event.isUploadedToNS, bolus.amount != previousAmount {
+                event.isUploadedToNS = false
+            }
+            if !dose.isMutable {
+                debug(.coreData, "Finalized bolus \(dose.syncIdentifier ?? "-"): \(bolus.amount ?? 0) U")
+            }
+
+        case PumpEventStored.EventType.tempBasal.rawValue:
+            guard let tempBasal = event.tempBasal else { return }
+            let previousRate = tempBasal.rate
+            let previousDuration = tempBasal.duration
+            // The dose says what this is; the row's own flag is stale exactly when it matters,
+            // and reading it back would let a schedule report keep a temp basal's identity —
+            // and with it a 24 h placeholder span read as delivery.
+            let isScheduledBasal = dose.type == .basal
+            let span = Self.storedSpan(of: dose, isScheduledBasal: isScheduledBasal)
+            tempBasal.isScheduledBasal = isScheduledBasal
+            tempBasal.duration = span.duration
+            tempBasal.rate = Decimal(dose.unitsPerHour) as NSDecimalNumber
+            tempBasal.startDate = span.start
+            tempBasal.endDate = span.end
+            tempBasal.deliveredUnits = dose.deliveredUnits.map { Decimal($0) as NSDecimalNumber }
+            event.isMutable = dose.isMutable
+            if event.isUploadedToNS, tempBasal.rate != previousRate || tempBasal.duration != previousDuration {
+                event.isUploadedToNS = false
+            }
+            if !dose.isMutable {
+                debug(
+                    .coreData,
+                    "Finalized temp basal \(dose.syncIdentifier ?? "-"): \(tempBasal.rate ?? 0) U/hr, \(tempBasal.duration) min"
+                )
+            }
+
+        default:
+            // non-dose rows have no revisable payload
+            event.isMutable = dose.isMutable
+        }
+    }
+
+    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async {
+        let context = makeContext()
+        context.name = "storeExternalInsulinEvent"
+        context.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
+        await context.perform {
+            // create pump event
+            let newPumpEvent = PumpEventStored(context: context)
+            let identifier = UUID().uuidString
+            newPumpEvent.id = identifier
+            // Trio-created record: it is its own source of truth, born final.
+            newPumpEvent.syncIdentifier = identifier
+            newPumpEvent.isMutable = false
+            // restrict entry to now or past
+            newPumpEvent.timestamp = timestamp > Date() ? Date() : timestamp
+            newPumpEvent.type = PumpEvent.bolus.rawValue
+            newPumpEvent.isUploadedToNS = false
+            newPumpEvent.isUploadedToHealth = false
+            newPumpEvent.isUploadedToTidepool = false
+
+            // create bolus entry and specify relationship to pump event
+            let newBolusEntry = BolusStored(context: context)
+            newBolusEntry.pumpEvent = newPumpEvent
+            newBolusEntry.amount = amount as NSDecimalNumber
+            newBolusEntry.programmedAmount = amount as NSDecimalNumber
+            newBolusEntry.isExternal = true // we are creating an external dose
+            newBolusEntry.isSMB = false // the dose is manually administered
+
+            do {
+                guard context.hasChanges else { return }
+                try context.save()
+                debug(.coreData, "External insulin saved")
+                self.updateSubject.send(())
+            } catch {
+                debug(.coreData, "Failed to store external insulin in context: \(error)")
+            }
+        }
+    }
+
+    func getPumpHistory() async throws -> [PumpHistoryEvent] {
+        let context = makeContext()
+        context.name = "getPumpHistory"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: PumpEventStored.self,
+            onContext: context,
+            predicate: NSPredicate.pumpHistoryLast24h,
+            key: "timestamp",
+            ascending: false,
+            relationshipKeyPathsForPrefetching: ["bolus", "tempBasal"]
+        )
+
+        return await context.perform {
+            guard let fetchedPumpEvents = results as? [PumpEventStored] else { return [] }
+
+            return fetchedPumpEvents.map { event in
+                switch event.type {
+                case PumpEventStored.EventType.bolus.rawValue:
+                    return PumpHistoryEvent(
+                        id: event.id ?? UUID().uuidString,
+                        type: .bolus,
+                        timestamp: event.timestamp ?? Date(),
+                        amount: event.bolus?.amount as Decimal?
+                    )
+                case PumpEventStored.EventType.tempBasal.rawValue:
+                    return PumpHistoryEvent(
+                        id: event.id ?? UUID().uuidString,
+                        type: .tempBasal,
+                        timestamp: event.timestamp ?? Date(),
+                        amount: event.tempBasal?.rate as Decimal?,
+                        duration: Int(event.tempBasal?.duration ?? 0),
+                        isScheduledBasal: event.tempBasal?.isScheduledBasal ?? false,
+                        deliveredUnits: event.tempBasal?.deliveredUnits as Decimal?
+                    )
+                // TDD and scheduled-basal inference need suspension spans
+                case PumpEventStored.EventType.pumpSuspend.rawValue:
+                    return PumpHistoryEvent(
+                        id: event.id ?? UUID().uuidString,
+                        type: .pumpSuspend,
+                        timestamp: event.timestamp ?? Date()
+                    )
+                case PumpEventStored.EventType.pumpResume.rawValue:
+                    return PumpHistoryEvent(
+                        id: event.id ?? UUID().uuidString,
+                        type: .pumpResume,
+                        timestamp: event.timestamp ?? Date()
+                    )
+                default:
+                    return nil
+                }
+            }.compactMap { $0 }
+        }
+    }
+
+    func determineBolusEventType(for event: PumpEventStored) -> PumpEventStored.EventType {
+        guard let bolus = event.bolus else {
+            return event.type.flatMap({ PumpEventStored.EventType(rawValue: $0) }) ?? .bolus
+        }
+        if bolus.isSMB {
+            return .smb
+        }
+        if bolus.isExternal {
+            return .isExternal
+        }
+        return event.type.flatMap({ PumpEventStored.EventType(rawValue: $0) }) ?? .bolus
+    }
+
+    func getPumpHistoryNotYetUploadedToNightscout() async throws -> [NightscoutTreatment] {
+        let context = makeContext()
+        context.name = "getPumpHistoryNotYetUploadedToNightscout"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: PumpEventStored.self,
+            onContext: context,
+            predicate: NSPredicate.pumpEventsNotYetUploadedToNightscout,
+            key: "timestamp",
+            ascending: false,
+            relationshipKeyPathsForPrefetching: ["bolus", "tempBasal"]
+        )
+
+        return try await context.perform { [self] in
+            guard let fetchedPumpEvents = results as? [PumpEventStored] else {
+                throw CoreDataError.fetchError(function: #function, file: #file)
+            }
+
+            return fetchedPumpEvents.map { event in
+                switch event.type {
+                case PumpEvent.bolus.rawValue:
+                    // eventType determines whether bolus is external, smb or manual (=administered via app by user)
+                    let eventType = determineBolusEventType(for: event)
+                    return NightscoutTreatment(
+                        duration: nil,
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: nil,
+                        rate: nil,
+                        eventType: eventType,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: event.bolus?.amount as Decimal?,
+                        notes: nil,
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil,
+                        id: event.id
+                    )
+                case PumpEvent.tempBasal.rawValue:
+                    return NightscoutTreatment(
+                        duration: Int(event.tempBasal?.duration ?? 0),
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: event.tempBasal?.rate as Decimal?,
+                        rate: event.tempBasal?.rate as Decimal?,
+                        eventType: .nsTempBasal,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: nil,
+                        notes: nil,
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil,
+                        id: event.id
+                    )
+                case PumpEvent.pumpSuspend.rawValue:
+                    return NightscoutTreatment(
+                        duration: nil,
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: nil,
+                        rate: nil,
+                        eventType: .nsNote,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: nil,
+                        notes: PumpEvent.pumpSuspend.rawValue,
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil
+                    )
+                case PumpEvent.pumpResume.rawValue:
+                    return NightscoutTreatment(
+                        duration: nil,
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: nil,
+                        rate: nil,
+                        eventType: .nsNote,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: nil,
+                        notes: PumpEvent.pumpResume.rawValue,
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil
+                    )
+                case PumpEvent.rewind.rawValue:
+                    return NightscoutTreatment(
+                        duration: nil,
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: nil,
+                        rate: nil,
+                        eventType: .nsInsulinChange,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: nil,
+                        notes: nil,
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil
+                    )
+                case PumpEvent.siteChange.rawValue:
+                    return NightscoutTreatment(
+                        duration: nil,
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: nil,
+                        rate: nil,
+                        eventType: .nsSiteChange,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: nil,
+                        notes: nil,
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil
+                    )
+                case PumpEvent.pumpAlarm.rawValue:
+                    return NightscoutTreatment(
+                        duration: 30, // minutes
+                        rawDuration: nil,
+                        rawRate: nil,
+                        absolute: nil,
+                        rate: nil,
+                        eventType: .nsAnnouncement,
+                        createdAt: event.timestamp,
+                        enteredBy: NightscoutTreatment.local,
+                        bolus: nil,
+                        insulin: nil,
+                        notes: "Alarm \(String(describing: event.note)) \(PumpEvent.pumpAlarm.rawValue)",
+                        carbs: nil,
+                        fat: nil,
+                        protein: nil,
+                        targetTop: nil,
+                        targetBottom: nil
+                    )
+
+                default:
+                    return nil
+                }
+            }.compactMap { $0 }
+        }
+    }
+
+    func getPumpHistoryNotYetUploadedToHealth() async throws -> [PumpHistoryEvent] {
+        let context = makeContext()
+        context.name = "getPumpHistoryNotYetUploadedToHealth"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: PumpEventStored.self,
+            onContext: context,
+            predicate: NSPredicate.pumpEventsNotYetUploadedToHealth,
+            key: "timestamp",
+            ascending: false,
+            relationshipKeyPathsForPrefetching: ["bolus", "tempBasal"]
+        )
+
+        return try await context.perform {
+            guard let fetchedPumpEvents = results as? [PumpEventStored] else {
+                throw CoreDataError.fetchError(function: #function, file: #file)
+            }
+
+            return fetchedPumpEvents.map { event in
+                switch event.type {
+                case PumpEvent.bolus.rawValue:
+                    return PumpHistoryEvent(
+                        id: event.id ?? UUID().uuidString,
+                        type: .bolus,
+                        timestamp: event.timestamp ?? Date(),
+                        amount: event.bolus?.amount as Decimal?,
+                        isExternal: event.bolus?.isExternal ?? false,
+                        insulinType: event.insulinType
+                    )
+                case PumpEvent.tempBasal.rawValue:
+                    if let id = event.id, let timestamp = event.timestamp, let tempBasal = event.tempBasal,
+                       let tempBasalRate = tempBasal.rate
+                    {
+                        return PumpHistoryEvent(
+                            id: id,
+                            type: .tempBasal,
+                            timestamp: timestamp,
+                            amount: tempBasalRate as Decimal,
+                            duration: Int(tempBasal.duration),
+                            deliveredUnits: tempBasal.deliveredUnits as Decimal?,
+                            insulinType: event.insulinType
+                        )
+                    } else {
+                        return nil
+                    }
+                default:
+                    return nil
+                }
+            }.compactMap { $0 }
+        }
+    }
+
+    func getPumpHistoryNotYetUploadedToTidepool() async throws -> [PumpHistoryEvent] {
+        let context = makeContext()
+        context.name = "getPumpHistoryNotYetUploadedToTidepool"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: PumpEventStored.self,
+            onContext: context,
+            predicate: NSPredicate.pumpEventsNotYetUploadedToTidepool,
+            key: "timestamp",
+            ascending: false,
+            relationshipKeyPathsForPrefetching: ["bolus", "tempBasal"]
+        )
+
+        return try await context.perform {
+            guard let fetchedPumpEvents = results as? [PumpEventStored] else {
+                throw CoreDataError.fetchError(function: #function, file: #file)
+            }
+
+            return fetchedPumpEvents.map { event in
+                switch event.type {
+                case PumpEvent.bolus.rawValue:
+                    return PumpHistoryEvent(
+                        id: event.id ?? UUID().uuidString,
+                        type: .bolus,
+                        timestamp: event.timestamp ?? Date(),
+                        amount: event.bolus?.amount as Decimal?,
+                        isSMB: event.bolus?.isSMB ?? true,
+                        isExternal: event.bolus?.isExternal ?? false,
+                        programmedAmount: event.bolus?.programmedAmount as Decimal?,
+                        insulinType: event.insulinType
+                    )
+                case PumpEvent.tempBasal.rawValue:
+                    if let id = event.id, let timestamp = event.timestamp, let tempBasal = event.tempBasal,
+                       let tempBasalRate = tempBasal.rate
+                    {
+                        return PumpHistoryEvent(
+                            id: id,
+                            type: .tempBasal,
+                            timestamp: timestamp,
+                            amount: tempBasalRate as Decimal,
+                            duration: Int(tempBasal.duration),
+                            deliveredUnits: tempBasal.deliveredUnits as Decimal?,
+                            insulinType: event.insulinType
+                        )
+                    } else {
+                        return nil
+                    }
+
+                default:
+                    return nil
+                }
+            }.compactMap { $0 }
+        }
+    }
+}
+
+extension BasePumpHistoryStorage {
+    /// Fallback upsert key for events without a dose identifier.
+    struct TimestampAndType: Hashable {
+        let timestamp: Date
+        let type: String
+        let isScheduledBasal: Bool
+    }
+}
+
+extension PumpEventType {
+    /// Scheduled-basal reports become TBR rows tagged `isScheduledBasal`.
+    var storedEventType: PumpEventStored.EventType? {
+        switch self {
+        case .alarm: return .pumpAlarm
+        case .alarmClear: return nil
+        case .basal: return .tempBasal
+        case .bolus: return .bolus
+        case .prime: return .prime
+        case .resume: return .pumpResume
+        case .rewind: return .rewind
+        case .suspend: return .pumpSuspend
+        case .tempBasal: return .tempBasal
+        case .replaceComponent(componentType: .infusionSet),
+             .replaceComponent(componentType: .pump): return .siteChange
+        case .replaceComponent: return nil
+        @unknown default: return nil
+        }
+    }
+}

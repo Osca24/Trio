@@ -1,0 +1,492 @@
+import CoreData
+import Foundation
+import LoopKitUI
+import Swinject
+
+protocol TDDStorage {
+    func calculateTDD(
+        pumpManager: any PumpManagerUI,
+        pumpHistory: [PumpHistoryEvent],
+        basalProfile: [BasalProfileEntry]
+    ) async throws
+        -> TDDResult
+    func storeTDD(_ tddResult: TDDResult) async
+    func hasSufficientTDD() async throws -> Bool
+}
+
+/// Structure containing the results of TDD calculations
+struct TDDResult {
+    let total: Decimal
+    let bolus: Decimal
+    let tempBasal: Decimal
+    let scheduledBasal: Decimal
+    let weightedAverage: Decimal?
+    let hoursOfData: Double
+}
+
+/// Implementation of the TDD Calculator
+final class BaseTDDStorage: TDDStorage, Injectable {
+    @Injected() private var storage: FileStorage!
+
+    private let makeContext: () -> NSManagedObjectContext
+
+    init(resolver: Resolver, contextProvider: (() -> NSManagedObjectContext)? = nil) {
+        makeContext = contextProvider ?? { CoreDataStack.shared.newTaskContext() }
+        injectServices(resolver)
+    }
+
+    /// Main function to calculate TDD from pump history
+    /// - Parameters:
+    ///   - pumpManager: Representation of paired pump's PumpManagerUI
+    ///   - pumpHistory: Array of pump history events
+    ///   - basalProfile: Schedule used to infer delivery for uncovered gaps
+    /// - Returns: TDDResult containing all calculated values
+    func calculateTDD(
+        pumpManager: any PumpManagerUI,
+        pumpHistory: [PumpHistoryEvent],
+        basalProfile: [BasalProfileEntry]
+    ) async throws -> TDDResult {
+        debug(.apsManager, "Starting TDD calculation with \(pumpHistory.count) pump events")
+
+        // Log the first and last pump history events if available
+        let earliestEvent: String
+        let latestEvent: String
+
+        // We fetch descending, so invert logic
+        if let firstEvent = pumpHistory.last, let lastEvent = pumpHistory.first {
+            earliestEvent = "Type: \(firstEvent.type), Timestamp: \(firstEvent.timestamp.ISO8601Format())"
+            latestEvent = "Type: \(lastEvent.type), Timestamp: \(lastEvent.timestamp.ISO8601Format())"
+        } else {
+            earliestEvent = "No events available"
+            latestEvent = "No events available"
+            debug(.apsManager, "No pump history events available for logging.")
+        }
+
+        // Group events by type once to avoid multiple filters
+        let groupedEvents = Dictionary(grouping: pumpHistory, by: { $0.type })
+        let bolusEvents = groupedEvents[.bolus] ?? []
+        let allBasalEvents = groupedEvents[.tempBasal] ?? []
+        let tempBasalEvents = allBasalEvents.filter { $0.isScheduledBasal != true }
+        let pumpSuspendEvents = groupedEvents[.pumpSuspend] ?? []
+        let pumpResumeEvents = groupedEvents[.pumpResume] ?? []
+
+        let now = Date()
+        // Spans nothing else covers ran the pump's schedule, at the profile rate. The sweep owns
+        // *when*, so a span can never overlap a temp basal or a suspension; the profile owns the
+        // rate, because it is what Trio programmed into the pump.
+        let scheduledBasalSegments = ScheduledBasalInference.segments(
+            events: Self.timelineEvents(from: pumpHistory),
+            profile: basalProfile,
+            now: now
+        )
+
+        let suspensions = Self.suspensionSpans(
+            suspends: pumpSuspendEvents,
+            resumes: pumpResumeEvents,
+            now: now
+        )
+
+        // Calculate all components concurrently
+        async let pumpDataHours = calculatePumpDataHours(pumpHistory)
+        async let bolusInsulin = calculateBolusInsulin(bolusEvents)
+        async let scheduledBasalInsulin = calculateScheduledBasalInsulin(
+            scheduledBasalSegments,
+            roundToSupportedBasalRate: pumpManager.roundToSupportedBasalRate
+        )
+        async let tempBasalInsulin = calculateTempBasalInsulin(
+            tempBasalEvents, suspensions: suspensions,
+            now: now,
+            roundToSupportedBasalRate: pumpManager.roundToSupportedBasalRate
+        )
+        async let weightedAverage = calculateWeightedAverage()
+
+        // Await all concurrent calculations
+        let (hours, bolus, scheduled, temp, weighted) = try await (
+            pumpDataHours,
+            bolusInsulin,
+            scheduledBasalInsulin,
+            tempBasalInsulin,
+            weightedAverage
+        )
+
+        // Total insulin calculation
+        let total = bolus + temp + scheduled
+
+        // Safeguard against division by zero
+        let percentage: (Decimal, Decimal) -> String = { part, total in
+            total > 0 ? String(format: "%.2f", NSDecimalNumber(decimal: (part / total * 100).rounded(toPlaces: 2)).doubleValue) :
+                "0.00"
+        }
+
+        // Store log strings in variables to avoid Xcode auto formatter from breaking up the lines in log statement
+        let totalString = String(format: "%.2f", NSDecimalNumber(decimal: total.rounded(toPlaces: 2)).doubleValue)
+        let bolusString = String(format: "%.2f", NSDecimalNumber(decimal: bolus.rounded(toPlaces: 2)).doubleValue)
+        let tempBasalString = String(format: "%.2f", NSDecimalNumber(decimal: temp.rounded(toPlaces: 2)).doubleValue)
+        let scheduledBasalString = String(format: "%.2f", NSDecimalNumber(decimal: scheduled.rounded(toPlaces: 2)).doubleValue)
+        let weightedAvgString = String(format: "%.2f", NSDecimalNumber(decimal: weighted?.rounded(toPlaces: 2) ?? 0).doubleValue)
+        let hoursString = String(format: "%.5f", NSDecimalNumber(decimal: Decimal(hours).truncated(toPlaces: 5)).doubleValue)
+
+        debug(.apsManager, """
+        TDD Summary:
+        +-------------------+-----------+-----------+
+        | Type\t\t\t\t| Amount U\t| Percent %\t|
+        +-------------------+-----------+-----------+
+        | Total\t\t\t\t| \(totalString)\t\t| \t\t\t|
+        | Bolus\t\t\t\t| \(bolusString)\t\t| \(percentage(bolus, total))\t\t|
+        | Temp Basal\t\t| \(tempBasalString)\t\t| \(percentage(temp, total))\t\t|
+        | Scheduled Basal\t| \(scheduledBasalString)\t\t| \(percentage(scheduled, total))\t\t|
+        | Weighted Average\t| \(weightedAvgString)\t\t| \t\t\t|
+        +-------------------+-----------+-----------+
+        - Hours of Data: \(hoursString)
+        - Earliest Event: \(earliestEvent)
+        - Latest Event: \(latestEvent)
+        """)
+
+        // Return calculated TDDResult
+        return TDDResult(
+            total: total,
+            bolus: bolus,
+            tempBasal: temp,
+            scheduledBasal: scheduled,
+            weightedAverage: weighted,
+            hoursOfData: hours
+        )
+    }
+
+    /// Stores the Total Daily Dose (TDD) result in Core Data
+    /// - Parameter tddResult: The TDD result to store, containing total insulin, bolus, temp basal, scheduled basal and weighted average
+    func storeTDD(_ tddResult: TDDResult) async {
+        let context = makeContext()
+        context.name = "storeTDD"
+        await context.perform {
+            let tddStored = TDDStored(context: context)
+            tddStored.id = UUID()
+            tddStored.date = Date()
+            tddStored.total = NSDecimalNumber(decimal: tddResult.total)
+            tddStored.bolus = NSDecimalNumber(decimal: tddResult.bolus)
+            tddStored.tempBasal = NSDecimalNumber(decimal: tddResult.tempBasal)
+            tddStored.scheduledBasal = NSDecimalNumber(decimal: tddResult.scheduledBasal)
+            tddStored.weightedAverage = tddResult.weightedAverage.map { NSDecimalNumber(decimal: $0) }
+
+            do {
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch {
+                debug(.apsManager, "\(DebuggingIdentifiers.failed) Failed to save TDD: \(error)")
+            }
+        }
+    }
+
+    /// Calculates the number of hours of available pump history data
+    /// - Parameter pumpHistory: Array of pump history events
+    /// - Returns: Number of hours of available data
+    private func calculatePumpDataHours(_ pumpHistory: [PumpHistoryEvent]) -> Double {
+        guard let firstEvent = pumpHistory.last, // we are fetching in a descending order
+              let lastEvent = pumpHistory.first
+        else {
+            return 0
+        }
+
+        let startDate = firstEvent.timestamp
+        var endDate = lastEvent.timestamp
+
+        // If last event in the list is tempBasal, check if it is running longer than current time
+        // If yes, set current date, else ignore
+        if lastEvent.type == .tempBasal, lastEvent.timestamp > Date().addingTimeInterval(-1) {
+            endDate = Date()
+        }
+
+        return Double(endDate.timeIntervalSince(startDate)) / 3600.0
+    }
+
+    /// Calculates total bolus insulin from pump history
+    /// - Parameter bolusEvents: Array of pump history events of type bolus
+    /// - Returns: Total bolus insulin
+    private func calculateBolusInsulin(_ bolusEvents: [PumpHistoryEvent]) -> Decimal {
+        bolusEvents
+            .reduce(Decimal(0)) { totalBolusInsulin, event in
+//                let newTotalBolusInsulin =
+                totalBolusInsulin + (event.amount as Decimal? ?? 0)
+//                debug(
+//                    .apsManager,
+//                    "Bolus \(event.amount ?? 0) U dosed at \(event.timestamp.ISO8601Format()) added. New total bolus = \(newTotalBolusInsulin) U"
+//                )
+//                return newTotalBolusInsulin
+            }
+    }
+
+    /// Pairs each suspend with the resume that ends it, chronologically. Counts are
+    /// routinely unbalanced — the pump may still be suspended, or the window may open
+    /// mid-suspension — so positional pairing silently drops real spans.
+    /// - Returns: suspension spans, an open suspension ending at `now`
+    static func suspensionSpans(
+        suspends: [PumpHistoryEvent],
+        resumes: [PumpHistoryEvent],
+        now: Date
+    ) -> [(start: Date, end: Date)] {
+        let suspendTimes = suspends.map(\.timestamp).sorted()
+        let resumeTimes = resumes.map(\.timestamp).sorted()
+
+        var spans: [(start: Date, end: Date)] = []
+        var nextResume = resumeTimes.startIndex
+
+        for suspend in suspendTimes {
+            // spans never nest: skip resumes that belong to an earlier suspension
+            while nextResume < resumeTimes.endIndex, resumeTimes[nextResume] <= suspend {
+                nextResume += 1
+            }
+            guard nextResume < resumeTimes.endIndex else {
+                // no resume follows: the pump is still suspended
+                if suspend < now { spans.append((start: suspend, end: now)) }
+                break
+            }
+            spans.append((start: suspend, end: resumeTimes[nextResume]))
+            nextResume += 1
+        }
+        return spans
+    }
+
+    /// Calculates temporary basal insulin delivery for a given time period, accounting for interruptions and suspensions
+    /// - Parameters:
+    ///   - tempBasalEvents: Array of temporary basal events
+    ///   - suspensions: Suspension spans from `suspensionSpans(suspends:resumes:now:)`
+    ///   - roundToSupportedBasalRate: Closure to round rates to pump-supported values
+    /// - Returns: Total insulin delivered via temporary basal rates in units
+    func calculateTempBasalInsulin(
+        _ tempBasalEvents: [PumpHistoryEvent],
+        suspensions: [(start: Date, end: Date)],
+        now: Date,
+        roundToSupportedBasalRate: @escaping (_ unitsPerHour: Double) -> Double
+    ) -> Decimal {
+        guard !tempBasalEvents.isEmpty else { return 0 }
+
+        // Finalized rows carry the pump-reported total (suspends and pulse
+        // quantization included); timeline math covers only the rest.
+        let reportedInsulin = tempBasalEvents.compactMap(\.deliveredUnits).reduce(0, +)
+        let inferredEvents = tempBasalEvents.filter { $0.deliveredUnits == nil }
+        guard !inferredEvents.isEmpty else { return reportedInsulin }
+
+        var timeline = [(start: Date, end: Date, rate: Decimal)]()
+        for event in inferredEvents {
+            guard let duration = event.duration, let rate = event.amount else { continue }
+            let end = event.timestamp.addingTimeInterval(TimeInterval(duration * 60))
+            timeline.append((start: event.timestamp, end: end, rate: rate))
+        }
+        timeline.sort { $0.start < $1.start }
+
+        var totalInsulin: Decimal = 0
+
+        for (index, event) in timeline.enumerated() {
+            let start = event.start
+            // clamp to now for running temps, and to the temp that superseded this one
+            var end = min(event.end, now)
+            if index < timeline.count - 1 {
+                end = min(end, timeline[index + 1].start)
+            }
+            guard end > start else { continue }
+
+            // a suspension anywhere inside the window delivers nothing
+            let suspendedSeconds = suspensions.reduce(0.0) { total, suspension in
+                let overlapStart = max(start, suspension.start)
+                let overlapEnd = min(end, suspension.end)
+                return total + max(0, overlapEnd.timeIntervalSince(overlapStart))
+            }
+
+            let deliveredMinutes = max(0, (end.timeIntervalSince(start) - suspendedSeconds) / 60)
+            guard deliveredMinutes > 0 else { continue }
+
+            let durationHours = (Decimal(deliveredMinutes) / 60).truncated(toPlaces: 5)
+            let insulin = Decimal(roundToSupportedBasalRate(Double(event.rate * durationHours)))
+            if insulin > 0 { totalInsulin += insulin }
+        }
+
+        return reportedInsulin + totalInsulin
+    }
+
+    /// Sums the scheduled-basal segments the sweep resolved.
+    func calculateScheduledBasalInsulin(
+        _ segments: [ScheduledBasalInference.Segment],
+        roundToSupportedBasalRate: @escaping (_ unitsPerHour: Double) -> Double
+    ) -> Decimal {
+        segments.reduce(into: Decimal(0)) { totalInsulin, segment in
+            let durationHours = Decimal(segment.end.timeIntervalSince(segment.start) / 3600)
+            let insulin = Decimal(roundToSupportedBasalRate(Double(truncating: (segment.rate * durationHours) as NSNumber)))
+            if insulin > 0 { totalInsulin += insulin }
+        }
+    }
+
+    /// Maps pump history onto the inference timeline (temp basal intervals, suspend/resume points).
+    static func timelineEvents(from pumpHistory: [PumpHistoryEvent]) -> [ScheduledBasalInference.TimelineEvent] {
+        pumpHistory.compactMap { event in
+            switch event.type {
+            case .tempBasal:
+                // A scheduled-basal row asserts a rate, not a span: it covers nothing, so the
+                // sweep still sizes the gap. Its placeholder duration would otherwise mark up to
+                // 24 h covered and mute the very sweep that accounts for it. It stays in the
+                // timeline as a zero-width point so it can still anchor the window's start.
+                let minutes = event.isScheduledBasal == true ? 0 : (event.duration ?? 0)
+                let end = event.timestamp.addingTimeInterval(TimeInterval(minutes) * 60)
+                return ScheduledBasalInference.TimelineEvent(start: event.timestamp, end: end, kind: .tempBasal)
+            case .pumpSuspend:
+                return ScheduledBasalInference.TimelineEvent(start: event.timestamp, kind: .suspend)
+            case .pumpResume:
+                return ScheduledBasalInference.TimelineEvent(start: event.timestamp, kind: .resume)
+            default:
+                return nil
+            }
+        }
+    }
+
+    /// Calculates a weighted average of Total Daily Dose (TDD) based on recent and historical data
+    ///
+    /// The weighted average is calculated using two time periods:
+    /// - Recent: Last 2 hours of TDD data
+    /// - Historical: Last 10 days of TDD data
+    ///
+    /// The formula used is:
+    /// ```
+    /// weightedTDD = (weightPercentage × recent_average) + ((1 - weightPercentage) × historical_average)
+    /// ```
+    /// where weightPercentage defaults to 0.65 if not set in preferences
+    ///
+    /// - Returns: A weighted average of TDD as Decimal, or nil if insufficient data
+    /// - Note: The weight percentage can be configured in preferences. Default is 0.65 (65% recent, 35% historical)
+    private func calculateWeightedAverage() async throws -> Decimal? {
+        let tenDaysAgo = Date().addingTimeInterval(-10.days.timeInterval)
+        let twoHoursAgo = Date().addingTimeInterval(-2.hours.timeInterval)
+
+        let context = makeContext()
+        context.name = "calculateWeightedAverage"
+
+        return try await context.perform { () -> Decimal? in
+            let recent = try Self.aggregateTDD(from: twoHoursAgo, in: context)
+            let historical = try Self.aggregateTDD(from: tenDaysAgo, in: context)
+
+            // Extract into locals so SwiftFormat's isEmpty rule doesn't
+            // mis-rewrite the tuple member access into `!tuple.isEmpty`
+            let historicalCount = historical.count
+            let recentCount = recent.count
+            guard historicalCount > 0 else { return 0 }
+
+            let averageTDDLastTwoHours = recent.total / max(Decimal(recentCount), 1)
+            let averageTDDLastTenDays = historical.total / Decimal(historicalCount)
+
+            // Get weight percentage from preferences (default 0.65 if not set)
+            let userPreferences = self.storage.retrieve(OpenAPS.Settings.preferences, as: Preferences.self)
+            let weightPercentage = userPreferences?.weightPercentage ?? Decimal(0.65) // why is this 1 as default in trio-oref??
+
+            // weightedTDD = (weightPercentage × recent_average) + ((1 - weightPercentage) × historical_average)
+            let weightedTDD = weightPercentage * averageTDDLastTwoHours +
+                (1 - weightPercentage) * averageTDDLastTenDays
+
+            return weightedTDD.truncated(toPlaces: 3)
+        }
+    }
+
+    /// Runs a SUM(total) + COUNT aggregate on TDDStored for records with date >= `from`,
+    /// avoiding materializing hundreds of rows just to add them up.
+    private static func aggregateTDD(
+        from: Date,
+        in context: NSManagedObjectContext
+    ) throws -> (total: Decimal, count: Int) {
+        let request = NSFetchRequest<NSDictionary>(entityName: "TDDStored")
+        request.resultType = .dictionaryResultType
+        request.predicate = NSPredicate(format: "date >= %@ AND total != nil", from as NSDate)
+
+        let sumExp = NSExpressionDescription()
+        sumExp.name = "sumTotal"
+        sumExp.expression = NSExpression(forFunction: "sum:", arguments: [NSExpression(forKeyPath: "total")])
+        sumExp.expressionResultType = .decimalAttributeType
+
+        let countExp = NSExpressionDescription()
+        countExp.name = "countTotal"
+        countExp.expression = NSExpression(forFunction: "count:", arguments: [NSExpression(forKeyPath: "total")])
+        countExp.expressionResultType = .integer64AttributeType
+
+        request.propertiesToFetch = [sumExp, countExp]
+
+        guard let row = try context.fetch(request).first else {
+            return (0, 0)
+        }
+        let sum = (row["sumTotal"] as? NSDecimalNumber)?.decimalValue ?? 0
+        let count = (row["countTotal"] as? NSNumber)?.intValue ?? 0
+        return (sum, count)
+    }
+
+    /// Checks if there is enough Total Daily Dose (TDD) data collected over the past 7 days.
+    ///
+    /// This function performs a count fetch for TDDStored records in Core Data where:
+    /// - The record's date is within the last 7 days.
+    /// - The total value is greater than 0.
+    ///
+    /// It then checks if at least 75% of the expected data points are present,
+    /// assuming at least 288 expected entries per day (one every 5 minutes).
+    ///
+    /// - Returns: `true` if sufficient TDD data is available, otherwise `false`.
+    /// - Throws: An error if the Core Data count operation fails.
+    func hasSufficientTDD() async throws -> Bool {
+        let context = makeContext()
+        context.name = "hasSufficientTDD"
+        return try await BaseTDDStorage.hasSufficientTDD(context: context)
+    }
+
+    /// internal function with context exposed to enable testing
+    static func hasSufficientTDD(context: NSManagedObjectContext) async throws -> Bool {
+        try await context.perform {
+            let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: "TDDStored")
+            fetchRequest.predicate = NSPredicate(
+                format: "date > %@ AND total > 0",
+                Date().addingTimeInterval(-86400 * 7) as NSDate
+            )
+            fetchRequest.resultType = .countResultType
+
+            let count = try context.count(for: fetchRequest)
+            let threshold = Int(Double(7 * 288) * 0.75)
+            return count >= threshold
+        }
+    }
+}
+
+/// Finds the basal rate at the specified minute offset using binary search
+/// - Parameters:
+///   - totalMinutes: minute offset into a 24 hour day
+///   - profile: Array of basal profile entries sorted by time
+/// - Returns: Basal rate in units per hour, or nil if not found
+func findBasalRateForOffset(for totalMinutes: Int, in profile: [BasalProfileEntry]) -> Decimal? {
+    if profile.isEmpty {
+        return nil // not yet initalized
+    }
+
+    // Special case: If profile has only one entry, it applies for full 24 hours
+    // Return its rate immediately without searching
+    if profile.count == 1 {
+        return profile[0].rate
+    }
+
+    // Use binary search to efficiently find the applicable basal rate
+    // Profile entries are sorted by minutes, so we can divide and conquer
+    var left = 0
+    var right = profile.count - 1
+
+    while left <= right {
+        let mid = (left + right) / 2
+        let entry = profile[mid]
+        // Get end time for current entry - either next entry's start time or end of day (24 * 60 mins)
+        let nextMinutes = mid + 1 < profile.count ? profile[mid + 1].minutes : 24 * 60
+
+        // Check if target time falls within current entry's time range
+        if totalMinutes >= entry.minutes, totalMinutes < nextMinutes {
+            return entry.rate
+        }
+
+        // Adjust search range based on comparison
+        if totalMinutes < entry.minutes {
+            right = mid - 1 // Search in left half if target time is earlier
+        } else {
+            left = mid + 1 // Search in right half if target time is later
+        }
+    }
+
+    // No applicable rate found for the given time
+    return nil
+}

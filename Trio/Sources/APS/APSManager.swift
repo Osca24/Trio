@@ -1,0 +1,1591 @@
+import Combine
+import CoreData
+import Foundation
+import LoopKit
+import LoopKitUI
+import SwiftDate
+import Swinject
+
+protocol APSManager {
+    func heartbeat(date: Date)
+    /// Mark the next loop attempt as user-initiated (e.g. force-loop button).
+    /// Surfaces transient errors immediately instead of waiting for the
+    /// usual dwell threshold — when the user explicitly asks for a loop,
+    /// they want feedback even if the underlying error is "transient".
+    func markNextLoopUserInitiated()
+    func enactBolus(amount: Double, isSMB: Bool, callback: ((Bool, String) -> Void)?) async
+    var pumpManager: PumpManagerUI? { get set }
+    var bluetoothManager: BluetoothStateManager? { get }
+    var pumpDisplayState: CurrentValueSubject<PumpDisplayState?, Never> { get }
+    var pumpName: CurrentValueSubject<String, Never> { get }
+    var isLooping: CurrentValueSubject<Bool, Never> { get }
+    var lastLoopDate: Date { get }
+    var lastLoopDateSubject: PassthroughSubject<Date, Never> { get }
+    var bolusProgress: CurrentValueSubject<Decimal?, Never> { get }
+    var pumpExpiresAtDate: CurrentValueSubject<Date?, Never> { get }
+    var pumpActivatedAtDate: CurrentValueSubject<Date?, Never> { get }
+    var isManualTempBasal: Bool { get }
+    var isScheduledBasal: Bool? { get }
+    var isSuspended: Bool { get }
+    func determineBasal() async throws
+    /// Runs a determination outside the loop, after a treatment or adjustment changed what the
+    /// algorithm reads. Waits for a loop in flight to finish first, since that loop determined
+    /// before the change landed. Concurrent calls collapse into the one already running. Algorithm
+    /// errors propagate to the caller.
+    func determineBasalSync() async throws
+    func simulateDetermineBasal(
+        simulatedCarbsAmount: Decimal,
+        simulatedBolusAmount: Decimal,
+        simulatedCarbsDate: Date?
+    ) async -> Determination?
+    func roundBolus(amount: Decimal) -> Decimal
+    var lastError: CurrentValueSubject<Error?, Never> { get }
+    func cancelBolus(_ callback: ((Bool, String) -> Void)?) async
+    var iobFileDidUpdate: PassthroughSubject<Void, Never> { get }
+}
+
+/// Notified after a bolus-related failure so observing UI (e.g. the
+/// treatment screen's bolus state) can clean up state. Broadcast by
+/// `APSManager` from `enactBolus` / `cancelBolus` error paths.
+protocol BolusFailureObserver {
+    func bolusDidFail()
+}
+
+enum APSError: LocalizedError {
+    case pumpError(Error)
+    case invalidPumpState(message: String)
+    case glucoseError(message: String)
+    case apsError(message: String)
+    case manualBasalTemp(message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .pumpError(error):
+            return String(localized: "Pump Error (\(error.localizedDescription)).")
+        case let .invalidPumpState(message):
+            return String(localized: "Invalid Pump State (\(message)).")
+        case let .glucoseError(message):
+            return String(localized: "Invalid Glucose (\(message)).")
+        case let .apsError(message):
+            return String(localized: "Invalid Algorithm Response (\(message)).")
+        case let .manualBasalTemp(message):
+            return String(localized: "Manual Temporary Basal Rate (\(message)). Looping suspended.")
+        }
+    }
+}
+
+// MARK: - Thread-safe loop serialization
+
+/// Ensures only one loop runs at a time via actor isolation
+private actor LoopGuard {
+    private var isRunning = false
+    private var isDeterminingStandalone = false
+    private var loopWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Atomically checks whether a new loop can start and marks it as running if so.
+    func tryStart(minInterval: TimeInterval, lastLoopDate: Date, lastLoopStartDate: Date) -> Bool {
+        // If the last loop completed after it started, enforce minimum interval
+        if lastLoopDate > lastLoopStartDate {
+            guard lastLoopStartDate.addingTimeInterval(minInterval) < Date() else { return false }
+        }
+        guard !isRunning else { return false }
+        isRunning = true
+        return true
+    }
+
+    func finish() {
+        isRunning = false
+        let waiters = loopWaiters
+        loopWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    /// Returns once no loop is running.
+    func waitForLoop() async {
+        guard isRunning else { return }
+        await withCheckedContinuation { loopWaiters.append($0) }
+    }
+
+    /// Claims the guard for a determination that runs outside the loop. Refuses while another one
+    /// runs, since it computes the same state. `tryStart` ignores this claim: a skipped loop has a
+    /// therapy cost, an overlapping determination only wastes work.
+    func tryStartStandaloneDetermination() -> Bool {
+        guard !isDeterminingStandalone else { return false }
+        isDeterminingStandalone = true
+        return true
+    }
+
+    func finishStandaloneDetermination() {
+        isDeterminingStandalone = false
+    }
+}
+
+final class BaseAPSManager: APSManager, Injectable {
+    private let processQueue = DispatchQueue(label: "BaseAPSManager.processQueue")
+    @Injected() private var storage: FileStorage!
+    @Injected() private var pumpHistoryStorage: PumpHistoryStorage!
+    @Injected() private var alertHistoryStorage: AlertHistoryStorage!
+    @Injected() private var tempTargetsStorage: TempTargetsStorage!
+    @Injected() private var carbsStorage: CarbsStorage!
+    @Injected() private var glucoseStorage: GlucoseStorage!
+    @Injected() private var determinationStorage: DeterminationStorage!
+    @Injected() private var deviceDataManager: DeviceDataManager!
+    @Injected() private var settingsManager: SettingsManager!
+    @Injected() private var tddStorage: TDDStorage!
+    @Injected() private var broadcaster: Broadcaster!
+    @Injected() private var trioAlertManager: TrioAlertManager!
+    @Persisted(key: "lastLoopStartDate") private var lastLoopStartDate: Date = .distantPast
+    private var lastDosingMode: DosingMode?
+    @Persisted(key: "lastLoopDate") var lastLoopDate: Date = .distantPast {
+        didSet {
+            lastLoopDateSubject.send(lastLoopDate)
+        }
+    }
+
+    private var openAPS: OpenAPS!
+
+    private var lifetime = Lifetime()
+
+    private let loopGuard = LoopGuard()
+    /// All reads/writes are dispatched onto `processQueue` so the bolus
+    /// trigger sink, `cancelBolus`, and the `DoseProgressReporter`
+    /// callback (which the pump manager already invokes on
+    /// `processQueue`) all serialize through one queue
+    private var bolusReporter: DoseProgressReporter?
+
+    var pumpManager: PumpManagerUI? {
+        get { deviceDataManager.pumpManager }
+        set { deviceDataManager.pumpManager = newValue }
+    }
+
+    var bluetoothManager: BluetoothStateManager? { deviceDataManager.bluetoothManager }
+
+    @Persisted(key: "isManualTempBasal") var isManualTempBasal: Bool = false
+
+    @Persisted(key: "isScheduledBasal") var isScheduledBasal: Bool? = false
+
+    @Persisted(key: "isSuspended") var isSuspended: Bool = false
+
+    let isLooping = CurrentValueSubject<Bool, Never>(false)
+    let lastLoopDateSubject = PassthroughSubject<Date, Never>()
+    let lastError = CurrentValueSubject<Error?, Never>(nil)
+    let iobFileDidUpdate = PassthroughSubject<Void, Never>()
+
+    let bolusProgress = CurrentValueSubject<Decimal?, Never>(nil)
+
+    var pumpDisplayState: CurrentValueSubject<PumpDisplayState?, Never> {
+        deviceDataManager.pumpDisplayState
+    }
+
+    var pumpName: CurrentValueSubject<String, Never> {
+        deviceDataManager.pumpName
+    }
+
+    var pumpExpiresAtDate: CurrentValueSubject<Date?, Never> {
+        deviceDataManager.pumpExpiresAtDate
+    }
+
+    var pumpActivatedAtDate: CurrentValueSubject<Date?, Never> {
+        deviceDataManager.pumpActivatedAtDate
+    }
+
+    var settings: TrioSettings {
+        get { settingsManager.settings }
+        set { settingsManager.settings = newValue }
+    }
+
+    init(resolver: Resolver) {
+        injectServices(resolver)
+        openAPS = OpenAPS(storage: storage, tddStorage: tddStorage, glucoseStorage: glucoseStorage, carbsStorage: carbsStorage)
+        lastDosingMode = settingsManager.settings.dosingMode
+        broadcaster.register(SettingsObserver.self, observer: self)
+        subscribe()
+        lastLoopDateSubject.send(lastLoopDate)
+
+        isLooping
+            .weakAssign(to: \.deviceDataManager.loopInProgress, on: self)
+            .store(in: &lifetime)
+    }
+
+    private func subscribe() {
+        if settingsManager.settings.units == .mmolL {
+            let wasParsed = storage.parseOnFileSettingsToMgdL()
+            if wasParsed {
+                Task {
+                    do {
+                        try await openAPS.createProfiles(for: self.settingsManager.settings.dosingMode)
+                    } catch {
+                        debug(
+                            .apsManager,
+                            "\(DebuggingIdentifiers.failed) Error creating profiles: \(error)"
+                        )
+                    }
+                }
+            }
+        }
+
+        deviceDataManager.recommendsLoop
+            .receive(on: processQueue)
+            .sink { [weak self] in
+                self?.loop()
+            }
+            .store(in: &lifetime)
+
+        deviceDataManager.errorSubject
+            .receive(on: processQueue)
+            .map { APSError.pumpError($0) }
+            .sink { [weak self] in
+                self?.processError($0)
+            }
+            .store(in: &lifetime)
+
+        deviceDataManager.bolusTrigger
+            .receive(on: processQueue)
+            .sink { [weak self] bolusState in
+                switch bolusState {
+                case .initiating,
+                     .inProgress:
+                    self?.createBolusReporter()
+                case .noBolus:
+                    self?.clearBolusReporter()
+                }
+            }
+            .store(in: &lifetime)
+
+        // The following three publishers update `@Persisted` properties that
+        // are also read from the main thread (UI bindings)
+        deviceDataManager.scheduledBasal
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] scheduledBasal in
+                self?.isScheduledBasal = scheduledBasal
+            }
+            .store(in: &lifetime)
+
+        deviceDataManager.suspended
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] suspended in
+                self?.isSuspended = suspended
+            }
+            .store(in: &lifetime)
+
+        // manage a manual Temp Basal from PumpManager - force loop() after manual temp basal is cancelled or finishes
+        deviceDataManager.manualTempBasal
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] manualBasal in
+                if manualBasal {
+                    self?.isManualTempBasal = true
+                } else {
+                    if self?.isManualTempBasal == true {
+                        self?.isManualTempBasal = false
+                        self?.loop()
+                    }
+                }
+            }
+            .store(in: &lifetime)
+    }
+
+    func heartbeat(date: Date) {
+        deviceDataManager.heartbeat(date: date)
+    }
+
+    // Loop entry point
+    private func loop() {
+        Task { [weak self] in
+            guard let self else { return }
+
+            // Consume the user-initiated flag unconditionally — it was set
+            // for the loop the user just triggered. If the guards below block
+            // (suspended, too-soon, no pump), the next scheduled tick must
+            // not inherit it and bypass dwell suppression for an error the
+            // user didn't request.
+            let userInitiated = self.nextLoopUserInitiated
+            self.nextLoopUserInitiated = false
+
+            // Don't try to run a loop while pump setup / pod pairing is in
+            // progress — `verifyStatus` would throw `invalidPumpState("Pump
+            // not set")` and surface a modal banner on top of the pod
+            // activation sheet, closing the sheet (reported by tester during
+            // O5 pairing).
+            guard self.pumpManager != nil else {
+                debug(.apsManager, "No pump manager — skipping loop attempt")
+                return
+            }
+
+            // Atomic check-and-set via actor — eliminates the race between
+            // checking isLooping.value and sending isLooping(true).
+            guard await loopGuard.tryStart(
+                minInterval: Config.loopInterval,
+                lastLoopDate: lastLoopDate,
+                lastLoopStartDate: lastLoopStartDate
+            ) else {
+                debug(.apsManager, "Loop skipped (already running or too soon)")
+                return
+            }
+
+            // Affects whether transient errors surface immediately instead of
+            // dwell-suppressed (see `surfaceErrorIfNeeded`).
+            self.currentLoopUserInitiated = userInitiated
+            defer { self.currentLoopUserInitiated = false }
+
+            // Start background task
+            // we probably need to refactor this when implementing Swift 6 due to mutation of a captured var in an async context
+            var taskID: UIBackgroundTaskIdentifier = .invalid
+            taskID = await UIApplication.shared.beginBackgroundTask(withName: "Loop starting") {
+                // closure runs on the Main Thread
+                // removed the Task that provided no guarantee to end the background task
+                if taskID != .invalid {
+                    UIApplication.shared.endBackgroundTask(taskID)
+                    taskID = .invalid
+                }
+            }
+
+            isLooping.send(true)
+
+            let loopStartDate = Date()
+            lastLoopStartDate = loopStartDate
+            let interval = await calculateLoopInterval(loopStartDate: loopStartDate)
+
+            var loopStatRecord = LoopStats(
+                start: loopStartDate,
+                loopStatus: "Starting",
+                interval: interval
+            )
+
+            do {
+                try await executeLoop(loopStatRecord: &loopStatRecord)
+                requestNightscoutUpload(
+                    [.carbs, .pumpHistory, .overrides, .tempTargets],
+                    source: "APSManager"
+                )
+                await finalizeLoop(loopStatRecord: loopStatRecord)
+            } catch {
+                let endDate = Date()
+                loopStatRecord.end = endDate
+                loopStatRecord.duration = roundDouble((endDate - loopStatRecord.start).timeInterval / 60, 2)
+                loopStatRecord.loopStatus = error.localizedDescription
+                await finalizeLoop(error: error, loopStatRecord: loopStatRecord)
+                debug(.apsManager, "\(DebuggingIdentifiers.failed) Failed to complete Loop: \(error)")
+            }
+
+            // End the background task
+            if taskID != .invalid {
+                await UIApplication.shared.endBackgroundTask(taskID)
+                taskID = .invalid
+            }
+        }
+    }
+
+    private func executeLoop(loopStatRecord: inout LoopStats) async throws {
+        try await determineBasal()
+
+        // Closed loop: also enact the determination.
+        if settings.dosingMode.automation != .off {
+            try await enactDetermination()
+        }
+
+        let endDate = Date()
+        loopStatRecord.end = endDate
+        loopStatRecord.duration = roundDouble((endDate - loopStatRecord.start).timeInterval / 60, 2)
+        loopStatRecord.loopStatus = "Success"
+    }
+
+    private func calculateLoopInterval(loopStartDate: Date) async -> Double? {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "calculateLoopInterval"
+        do {
+            return try await context.perform { [weak self] in
+                guard let self else { return nil }
+                let requestStats = LoopStatRecord.fetchRequest() as NSFetchRequest<LoopStatRecord>
+                let sortStats = NSSortDescriptor(key: "end", ascending: false)
+                requestStats.sortDescriptors = [sortStats]
+                requestStats.fetchLimit = 1
+                let previousLoop = try context.fetch(requestStats)
+
+                if (previousLoop.first?.end ?? .distantFuture) < loopStartDate {
+                    return self.roundDouble(
+                        (loopStartDate - (previousLoop.first?.end ?? Date())).timeInterval / 60,
+                        1
+                    )
+                }
+                return nil
+            }
+        } catch {
+            debugPrint("\(DebuggingIdentifiers.failed) \(#file) \(#function) Failed to fetch the last loop with error: \(error)")
+            return nil
+        }
+    }
+
+    /// Single exit point for loop — replaces the old `loopCompleted()`.
+    private func finalizeLoop(error: Error? = nil, loopStatRecord: LoopStats) async {
+        await loopGuard.finish()
+        isLooping.send(false)
+
+        if let error = error {
+            warning(.apsManager, "Loop failed with error: \(error)")
+            processError(error)
+        } else {
+            debug(.apsManager, "Loop succeeded")
+            lastLoopDate = Date()
+            lastError.send(nil)
+            transientCategoryFirstSeen.removeAll()
+            transientCategoryCount.removeAll()
+        }
+
+        loopStats(loopStatRecord: loopStatRecord)
+
+        if settings.dosingMode.automation != .off {
+            await reportEnacted(wasEnacted: error == nil)
+        }
+    }
+
+    private func verifyStatus() -> Error? {
+        guard let pump = pumpManager else {
+            return APSError.invalidPumpState(message: String(localized: "Pump not set"))
+        }
+        let status = pump.status.pumpStatus
+
+        guard !status.bolusing else {
+            return APSError.invalidPumpState(message: String(localized: "Pump is bolusing"))
+        }
+
+        guard !status.suspended else {
+            return APSError.invalidPumpState(message: String(localized: "Pump suspended"))
+        }
+
+        let reservoir = storage.retrieve(OpenAPS.Monitor.reservoir, as: Decimal.self) ?? 100
+        guard reservoir >= 0 else {
+            return APSError.invalidPumpState(message: String(localized: "Reservoir is empty"))
+        }
+
+        return nil
+    }
+
+    func autosense() async throws -> Bool {
+        guard let autosense = await storage.retrieveAsync(OpenAPS.Settings.autosense, as: Autosens.self),
+              (autosense.timestamp ?? .distantPast).addingTimeInterval(30.minutes.timeInterval) > Date()
+        else {
+            let result = try await openAPS.autosense(
+                shouldSmoothGlucose: settingsManager.settings.smoothGlucose
+            )
+            return result != nil
+        }
+
+        return false
+    }
+
+    /// Calculates and stores the Total Daily Dose (TDD)
+    private func calculateAndStoreTDD() async throws {
+        guard let pumpManager else { return }
+
+        let basalProfile = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self) ?? []
+
+        // Calculate TDD; uncovered gaps are inferred from the basal profile in memory
+        let tddResult = try await tddStorage.calculateTDD(
+            pumpManager: pumpManager,
+            pumpHistory: pumpHistoryStorage.getPumpHistory(),
+            basalProfile: basalProfile
+        )
+
+        // Store TDD in Core Data
+        await tddStorage.storeTDD(tddResult)
+    }
+
+    func determineBasal() async throws {
+        debug(.apsManager, "Start determine basal")
+
+        try await calculateAndStoreTDD()
+
+        var invalidGlucoseError: String?
+
+        // Fetch glucose and run validation on the same context to avoid cross-context property access.
+        let validationContext = CoreDataStack.shared.newTaskContext()
+        validationContext.name = "determineBasal.validation"
+
+        let isValidGlucoseData = await validationContext.perform { [weak self] in
+            guard let self else { return false }
+
+            let glucose: [GlucoseStored]
+            do {
+                glucose = try self.fetchGlucose(
+                    on: validationContext,
+                    predicate: NSPredicate.predicateForOneHourAgo,
+                    fetchLimit: 6
+                )
+            } catch {
+                debug(.apsManager, "Failed to fetch glucose for validation: \(error)")
+                return false
+            }
+
+            guard glucose.count > 2 else {
+                debug(.apsManager, "Not enough glucose data")
+                invalidGlucoseError =
+                    String(
+                        localized: "Not enough glucose data. You need at least three glucose readings in the last six hours to run the algorithm."
+                    )
+                return false
+            }
+
+            let dateOfLastGlucose = glucose.first?.date
+            guard dateOfLastGlucose ?? Date() >= Date().addingTimeInterval(-12.minutes.timeInterval) else {
+                debug(.apsManager, "Glucose data is stale")
+                invalidGlucoseError =
+                    String(localized: "Glucose data is stale. The most recent glucose reading is from more than 12 minutes ago.")
+                return false
+            }
+
+            return true
+        }
+
+        do {
+            let now = Date()
+
+            // put profile creation up front since autosens needs it
+            try await openAPS.createProfiles(for: settingsManager.settings.dosingMode)
+            let currentTemp = try await fetchCurrentTempBasal(date: now)
+            _ = try await autosense()
+
+            let determination = try await openAPS.determineBasal(
+                for: settingsManager.settings.dosingMode,
+                currentTemp: currentTemp,
+                supportedBasalRates: supportedBasalRates,
+                shouldSmoothGlucose: settingsManager.settings.smoothGlucose,
+                clock: now
+            )
+            iobFileDidUpdate.send(())
+
+            guard isValidGlucoseData else {
+                throw APSError.glucoseError(message: "Glucose validation failed")
+            }
+
+            if let determination = determination {
+                // Capture weak self in closure
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.broadcaster.notify(DeterminationObserver.self, on: .main) {
+                        $0.determinationDidUpdate(determination)
+                    }
+                }
+            }
+        } catch {
+            iobFileDidUpdate.send(())
+
+            // if we have a glucose validation error we might still run
+            // determineBasal to try to get IoB and CoB updates but we
+            // know that it will fail, so the invalidGlucoseError always
+            // takes priority
+            if let invalidGlucoseError = invalidGlucoseError {
+                throw APSError.apsError(message: invalidGlucoseError)
+            } else {
+                throw APSError.apsError(message: "Error determining basal: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func determineBasalSync() async throws {
+        await loopGuard.waitForLoop()
+        guard await loopGuard.tryStartStandaloneDetermination() else {
+            debug(.apsManager, "Standalone determination skipped: one is already running")
+            return
+        }
+        do {
+            try await determineBasal()
+        } catch {
+            await loopGuard.finishStandaloneDetermination()
+            throw error
+        }
+        await loopGuard.finishStandaloneDetermination()
+    }
+
+    func simulateDetermineBasal(
+        simulatedCarbsAmount: Decimal,
+        simulatedBolusAmount: Decimal,
+        simulatedCarbsDate: Date? = nil
+    ) async -> Determination? {
+        do {
+            let temp = try await fetchCurrentTempBasal(date: Date.now)
+            return try await openAPS.determineBasal(
+                for: settingsManager.settings.dosingMode,
+                currentTemp: temp,
+                supportedBasalRates: supportedBasalRates,
+                shouldSmoothGlucose: settingsManager.settings.smoothGlucose,
+                clock: Date(),
+                simulatedCarbsAmount: simulatedCarbsAmount,
+                simulatedBolusAmount: simulatedBolusAmount,
+                simulatedCarbsDate: simulatedCarbsDate,
+                simulation: true
+            )
+        } catch {
+            debugPrint(
+                "\(DebuggingIdentifiers.failed) \(#file) \(#function) Error occurred in simulateDetermineBasal: \(error)"
+            )
+            return nil
+        }
+    }
+
+    /// The paired pump's deliverable basal rates, for the algorithm to round against.
+    /// Rounded to 3 dp because the kits build their tables as `Double(n) / 20` and similar, and the
+    /// resulting binary error would push an entry just above the clean rate it is meant to match.
+    private var supportedBasalRates: [Decimal] {
+        (pumpManager?.supportedBasalRates ?? []).map { Decimal($0).rounded(scale: 3) }
+    }
+
+    func roundBolus(amount: Decimal) -> Decimal {
+        guard let pump = pumpManager else { return amount }
+        let rounded = Decimal(pump.roundToSupportedBolusVolume(units: Double(amount)))
+        let maxBolus = Decimal(pump.roundToSupportedBolusVolume(units: Double(settingsManager.pumpSettings.maxBolus)))
+        return min(rounded, maxBolus)
+    }
+
+    func enactBolus(amount: Double, isSMB: Bool, callback: ((Bool, String) -> Void)?) async {
+        if amount <= 0 {
+            return
+        }
+
+        if let error = verifyStatus() {
+            processError(error)
+            // Capture broadcaster and queue before async context
+            let broadcaster = self.broadcaster
+            Task { @MainActor in
+                broadcaster?.notify(BolusFailureObserver.self, on: .main) {
+                    $0.bolusDidFail()
+                }
+            }
+            callback?(false, String(localized: "Error! Failed to enact bolus.", comment: "Error message for enacting a bolus"))
+            return
+        }
+
+        guard let pump = pumpManager else {
+            callback?(false, String(localized: "Error! Failed to enact bolus.", comment: "Error message for enacting a bolus"))
+            return
+        }
+
+        let roundedAmount = pump.roundToSupportedBolusVolume(units: amount)
+
+        debug(.apsManager, "Enact bolus \(roundedAmount), manual \(!isSMB)")
+
+        do {
+            try await pump.enactBolus(units: roundedAmount, automatic: isSMB)
+            debug(.apsManager, "Bolus succeeded")
+            bolusProgress.send(0)
+            callback?(true, String(localized: "Bolus enacted successfully.", comment: "Success message for enacting a bolus"))
+            if !isSMB {
+                do {
+                    try await determineBasalSync()
+                } catch {
+                    warning(
+                        .apsManager,
+                        "determineBasalSync after manual bolus failed: \(error.localizedDescription)"
+                    )
+                }
+            }
+        } catch {
+            warning(.apsManager, "Bolus failed with error: \(error)")
+            lastError.send(APSError.pumpError(error))
+            issueAlertForCategory(
+                .bolusFailed,
+                title: String(localized: "Bolus failed"),
+                body: String(localized: "Check pump history before repeating.")
+                    + "\n\n\(error.localizedDescription)"
+            )
+            if !isSMB {
+                let broadcaster = self.broadcaster
+                Task { @MainActor in
+                    broadcaster?.notify(BolusFailureObserver.self, on: .main) {
+                        $0.bolusDidFail()
+                    }
+                }
+            }
+            callback?(
+                false,
+                String(localized: "Error! Bolus failed with error: \(error.localizedDescription)")
+            )
+        }
+    }
+
+    func cancelBolus(_ callback: ((Bool, String) -> Void)?) async {
+        guard let pump = pumpManager, pump.status.pumpStatus.bolusing else { return }
+        debug(.apsManager, "Cancel bolus")
+        do {
+            _ = try await pump.cancelBolus()
+            debug(.apsManager, "Bolus cancelled")
+            callback?(true, String(localized: "Bolus cancelled successfully.", comment: "Success message for canceling a bolus"))
+        } catch {
+            debug(.apsManager, "Bolus cancellation failed with error: \(error)")
+            lastError.send(APSError.pumpError(error))
+            issueAlertForCategory(
+                .bolusFailed,
+                title: String(localized: "Bolus cancellation failed"),
+                body: String(localized: "Try again.") + "\n\n\(error.localizedDescription)"
+            )
+            callback?(
+                false,
+                String(
+                    localized: "Error! Bolus cancellation failed with error: \(error.localizedDescription)",
+                    comment: "Error message for canceling a bolus"
+                )
+            )
+        }
+        clearBolusReporter()
+    }
+
+    private func fetchCurrentTempBasal(date: Date) async throws -> TempBasal {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "fetchCurrentTempBasal"
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: PumpEventStored.self,
+            onContext: context,
+            predicate: NSPredicate.recentPumpHistory,
+            key: "timestamp",
+            ascending: false,
+            fetchLimit: 1,
+            relationshipKeyPathsForPrefetching: ["tempBasal"]
+        )
+
+        let fetchedTempBasal = await context.perform {
+            guard let fetchedResults = results as? [PumpEventStored],
+                  let tempBasalEvent = fetchedResults.first,
+                  let tempBasal = tempBasalEvent.tempBasal,
+                  let eventTimestamp = tempBasalEvent.timestamp
+            else {
+                return TempBasal(duration: 0, rate: 0, temp: .absolute, timestamp: date)
+            }
+
+            let delta = Int((date.timeIntervalSince1970 - eventTimestamp.timeIntervalSince1970) / 60)
+            let duration = max(0, Int(tempBasal.duration) - delta)
+            let rate = tempBasal.rate as? Decimal ?? 0
+            return TempBasal(duration: duration, rate: rate, temp: .absolute, timestamp: date)
+        }
+
+        guard let state = pumpManager?.status.basalDeliveryState else { return fetchedTempBasal }
+
+        switch state {
+        case .active:
+            return TempBasal(duration: 0, rate: 0, temp: .absolute, timestamp: date)
+        case let .tempBasal(dose):
+            let rate = Decimal(dose.unitsPerHour)
+            let durationMin = max(0, Int((dose.endDate.timeIntervalSince1970 - date.timeIntervalSince1970) / 60))
+            return TempBasal(duration: durationMin, rate: rate, temp: .absolute, timestamp: date)
+        default:
+            return fetchedTempBasal
+        }
+    }
+
+    private func enactDetermination() async throws {
+        guard let determinationID = try await determinationStorage
+            .fetchLastDeterminationObjectID(predicate: NSPredicate.predicateFor30MinAgoForDetermination).first
+        else {
+            throw APSError.apsError(message: "Determination not found")
+        }
+
+        guard let pump = pumpManager else {
+            throw APSError.apsError(message: "Pump not set")
+        }
+
+        if pump.status.pumpStatus.suspended {
+            debug(.apsManager, "Skipping enactDetermination because pump is suspended")
+            return
+        }
+
+        // Unable to do temp basal during manual temp basal 😁
+        if isManualTempBasal {
+            throw APSError.manualBasalTemp(message: "Loop not possible during the manual basal temp")
+        }
+
+        let (rateDecimal, durationInSeconds, smbToDeliver) = try await setValues(determinationID: determinationID)
+
+        if let rate = rateDecimal, let duration = durationInSeconds {
+            try await performBasal(pump: pump, rate: rate, duration: duration)
+        }
+
+        // only perform a bolus if smbToDeliver is > 0
+        if let smb = smbToDeliver, smb.compare(NSDecimalNumber(value: 0)) == .orderedDescending {
+            try await performBolus(pump: pump, smbToDeliver: smb)
+        }
+    }
+
+    private func setValues(determinationID: NSManagedObjectID) async throws
+        -> (NSDecimalNumber?, TimeInterval?, NSDecimalNumber?)
+    {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "setValues"
+        return try await context.perform {
+            do {
+                let determination = try context.existingObject(with: determinationID) as? OrefDetermination
+
+                let rate = determination?.rate
+                let duration = determination?.duration.flatMap { TimeInterval(truncating: $0) * 60 }
+                let smbToDeliver = determination?.smbToDeliver ?? 0
+
+                return (rate, duration, smbToDeliver)
+            } catch {
+                throw error
+            }
+        }
+    }
+
+    private func performBasal(pump: PumpManager, rate: NSDecimalNumber, duration: TimeInterval) async throws {
+        // the algorithm already floored this against the pump's own table, so don't floor it
+        // again here: the Decimal -> Double hop can land a hair low and cost a whole increment
+        let unitsPerHour = rate.decimalValue.nearestDouble
+        if pump.roundToSupportedBasalRate(unitsPerHour: unitsPerHour) != unitsPerHour {
+            debug(.apsManager, "Temp basal \(unitsPerHour) U/hr is not on the pump's rate table")
+        }
+        try await pump.enactTempBasal(unitsPerHour: unitsPerHour, for: duration)
+    }
+
+    private func performBolus(pump: PumpManager, smbToDeliver: NSDecimalNumber) async throws {
+        try await pump.enactBolus(units: smbToDeliver.decimalValue.nearestDouble, automatic: true)
+        bolusProgress.send(0)
+    }
+
+    private func reportEnacted(wasEnacted: Bool) async {
+        do {
+            guard let determinationID = try await determinationStorage
+                .fetchLastDeterminationObjectID(predicate: NSPredicate.predicateFor30MinAgoForDetermination).first
+            else {
+                debug(.apsManager, "No determination found to report enacted status")
+                return
+            }
+
+            let context = CoreDataStack.shared.newTaskContext()
+            context.name = "reportEnacted"
+            try await context.perform {
+                guard let determinationUpdated = try context
+                    .existingObject(with: determinationID) as? OrefDetermination
+                else {
+                    debug(.apsManager, "Could not find determination object in context")
+                    return
+                }
+
+                determinationUpdated.timestamp = Date()
+                determinationUpdated.enacted = wasEnacted
+                determinationUpdated.isUploadedToNS = false
+
+                guard context.hasChanges else { return }
+                try context.save()
+                debug(.apsManager, "Determination enacted. Enacted: \(wasEnacted)")
+            }
+        } catch {
+            debug(
+                .apsManager,
+                "\(DebuggingIdentifiers.failed) Error reporting enacted status: \(error)"
+            )
+        }
+    }
+
+    private func roundDecimal(_ decimal: Decimal, _ digits: Double) -> Decimal {
+        let rounded = round(Double(decimal) * pow(10, digits)) / pow(10, digits)
+        return Decimal(rounded)
+    }
+
+    private func roundDouble(_ double: Double, _ digits: Double) -> Double {
+        let rounded = round(Double(double) * pow(10, digits)) / pow(10, digits)
+        return rounded
+    }
+
+    private func medianCalculationDouble(array: [Double]) -> Double {
+        guard !array.isEmpty else {
+            return 0
+        }
+        let sorted = array.sorted()
+        let length = array.count
+
+        if length % 2 == 0 {
+            return (sorted[length / 2 - 1] + sorted[length / 2]) / 2
+        }
+        return sorted[length / 2]
+    }
+
+    private func medianCalculation(array: [Int]) -> Double {
+        guard !array.isEmpty else {
+            return 0
+        }
+        let sorted = array.sorted()
+        let length = array.count
+
+        if length % 2 == 0 {
+            return Double((sorted[length / 2 - 1] + sorted[length / 2]) / 2)
+        }
+        return Double(sorted[length / 2])
+    }
+
+    /// Computes Time-in-Range statistics. Must be called from within a
+    /// `perform`/`performAndWait` block on the context that owns `glucose`.
+    private func tir(_ glucose: [GlucoseStored]) -> (TIR: Double, hypos: Double, hypers: Double, normal_: Double) {
+        let justGlucoseArray = glucose.compactMap({ each in Int(each.glucose as Int16) })
+        let totalReadings = justGlucoseArray.count
+        let highLimit = settingsManager.settings.high
+        let lowLimit = settingsManager.settings.low
+        let hyperArray = glucose.filter({ $0.glucose >= Int(highLimit) })
+        let hyperReadings = hyperArray.compactMap({ each in each.glucose as Int16 }).count
+        let hyperPercentage = Double(hyperReadings) / Double(totalReadings) * 100
+        let hypoArray = glucose.filter({ $0.glucose <= Int(lowLimit) })
+        let hypoReadings = hypoArray.compactMap({ each in each.glucose as Int16 }).count
+        let hypoPercentage = Double(hypoReadings) / Double(totalReadings) * 100
+        // Euglycemic range
+        let normalArray = glucose.filter({ $0.glucose >= 70 && $0.glucose <= 140 })
+        let normalReadings = normalArray.compactMap({ each in each.glucose as Int16 }).count
+        let normalPercentage = Double(normalReadings) / Double(totalReadings) * 100
+        // TIR
+        let tir = 100 - (hypoPercentage + hyperPercentage)
+        return (
+            roundDouble(tir, 1),
+            roundDouble(hypoPercentage, 1),
+            roundDouble(hyperPercentage, 1),
+            roundDouble(normalPercentage, 1)
+        )
+    }
+
+    private func glucoseStats(_ fetchedGlucose: [GlucoseStored])
+        -> (ifcc: Double, ngsp: Double, average: Double, median: Double, sd: Double, cv: Double, readings: Double)
+    {
+        let glucose = fetchedGlucose
+        // First date
+        let last = glucose.last?.date ?? Date()
+        // Last date (recent)
+        let first = glucose.first?.date ?? Date()
+        // Total time in days
+        let numberOfDays = (first - last).timeInterval / 8.64E4
+        let denominator = numberOfDays < 1 ? 1 : numberOfDays
+        let justGlucoseArray = glucose.compactMap({ each in Int(each.glucose as Int16) })
+        let sumReadings = justGlucoseArray.reduce(0, +)
+        let countReadings = justGlucoseArray.count
+        let glucoseAverage = Double(sumReadings) / Double(countReadings)
+        let medianGlucose = medianCalculation(array: justGlucoseArray)
+        var NGSPa1CStatisticValue = 0.0
+        var IFCCa1CStatisticValue = 0.0
+
+        NGSPa1CStatisticValue = (glucoseAverage + 46.7) / 28.7 // NGSP (%)
+        IFCCa1CStatisticValue = 10.929 *
+            (NGSPa1CStatisticValue - 2.152) // IFCC (mmol/mol)  A1C(mmol/mol) = 10.929 * (A1C(%) - 2.15)
+        var sumOfSquares = 0.0
+
+        for array in justGlucoseArray {
+            sumOfSquares += pow(Double(array) - Double(glucoseAverage), 2)
+        }
+        var sd = 0.0
+        var cv = 0.0
+        // Avoid division by zero
+        if glucoseAverage > 0 {
+            sd = sqrt(sumOfSquares / Double(countReadings))
+            cv = sd / Double(glucoseAverage) * 100
+        }
+        let conversionFactor = 0.0555
+        let units = settingsManager.settings.units
+
+        var output: (ifcc: Double, ngsp: Double, average: Double, median: Double, sd: Double, cv: Double, readings: Double)
+        output = (
+            ifcc: IFCCa1CStatisticValue,
+            ngsp: NGSPa1CStatisticValue,
+            average: glucoseAverage * (units == .mmolL ? conversionFactor : 1),
+            median: medianGlucose * (units == .mmolL ? conversionFactor : 1),
+            sd: sd * (units == .mmolL ? conversionFactor : 1), cv: cv,
+            readings: Double(countReadings) / denominator
+        )
+        return output
+    }
+
+    private func loops(_ fetchedLoops: [LoopStatRecord]) -> Loops {
+        let loops = fetchedLoops
+        // First date
+        let previous = loops.last?.end ?? Date()
+        // Last date (recent)
+        let current = loops.first?.start ?? Date()
+        // Total time in days
+        let totalTime = (current - previous).timeInterval / 8.64E4
+        //
+        let durationArray = loops.compactMap({ each in each.duration })
+        let durationArrayCount = durationArray.count
+        let durationAverage = durationArray.reduce(0, +) / Double(durationArrayCount) * 60
+        let medianDuration = medianCalculationDouble(array: durationArray) * 60
+        let max_duration = (durationArray.max() ?? 0) * 60
+        let min_duration = (durationArray.min() ?? 0) * 60
+        let successsNR = loops.compactMap({ each in each.loopStatus }).filter({ each in each!.contains("Success") }).count
+        let errorNR = durationArrayCount - successsNR
+        let total = Double(successsNR + errorNR) == 0 ? 1 : Double(successsNR + errorNR)
+        let successRate: Double? = (Double(successsNR) / total) * 100
+        let loopNr = totalTime <= 1 ? total : round(total / (totalTime != 0 ? totalTime : 1))
+        let intervalArray = loops.compactMap({ each in each.interval as Double })
+        let count = intervalArray.count != 0 ? intervalArray.count : 1
+        let median_interval = medianCalculationDouble(array: intervalArray)
+        let intervalAverage = intervalArray.reduce(0, +) / Double(count)
+        let maximumInterval = intervalArray.max()
+        let minimumInterval = intervalArray.min()
+        //
+        let output = Loops(
+            loops: Int(loopNr),
+            errors: errorNR,
+            success_rate: roundDecimal(Decimal(successRate ?? 0), 1),
+            avg_interval: roundDecimal(Decimal(intervalAverage), 1),
+            median_interval: roundDecimal(Decimal(median_interval), 1),
+            min_interval: roundDecimal(Decimal(minimumInterval ?? 0), 1),
+            max_interval: roundDecimal(Decimal(maximumInterval ?? 0), 1),
+            avg_duration: roundDecimal(Decimal(durationAverage), 1),
+            median_duration: roundDecimal(Decimal(medianDuration), 1),
+            min_duration: roundDecimal(Decimal(min_duration), 1),
+            max_duration: roundDecimal(Decimal(max_duration), 1)
+        )
+        return output
+    }
+
+    /// Synchronously fetches glucose on the given context. Must be called from within a `perform`/`performAndWait` block of that context
+    func fetchGlucose(
+        on context: NSManagedObjectContext,
+        predicate: NSPredicate,
+        fetchLimit: Int? = nil,
+        batchSize: Int? = nil
+    ) throws -> [GlucoseStored] {
+        let results = try CoreDataStack.shared.fetchEntities(
+            ofType: GlucoseStored.self,
+            onContext: context,
+            predicate: predicate,
+            key: "date",
+            ascending: false,
+            fetchLimit: fetchLimit,
+            batchSize: batchSize
+        )
+        guard let glucoseResults = results as? [GlucoseStored] else {
+            throw CoreDataError.fetchError(function: #function, file: #file)
+        }
+        return glucoseResults
+    }
+
+    private func lastLoopForStats() async -> Date? {
+        let requestStats = StatsData.fetchRequest() as NSFetchRequest<StatsData>
+        let sortStats = NSSortDescriptor(key: "lastrun", ascending: false)
+        requestStats.sortDescriptors = [sortStats]
+        requestStats.fetchLimit = 1
+
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "lastLoopForStats"
+        return await context.perform {
+            do {
+                return try context.fetch(requestStats).first?.lastrun
+            } catch {
+                print(error.localizedDescription)
+                return .distantPast
+            }
+        }
+    }
+
+    private func loopStats(oneDayGlucose: Double) async -> LoopCycles {
+        let requestLSR = LoopStatRecord.fetchRequest() as NSFetchRequest<LoopStatRecord>
+        requestLSR.predicate = NSPredicate(
+            format: "interval > 0 AND start > %@",
+            Date().addingTimeInterval(-24.hours.timeInterval) as NSDate
+        )
+        let sortLSR = NSSortDescriptor(key: "start", ascending: false)
+        requestLSR.sortDescriptors = [sortLSR]
+
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "loopStats"
+        return await context.perform {
+            do {
+                let lsr = try context.fetch(requestLSR)
+
+                // Compute LoopStats for 24 hours
+                let oneDayLoops = self.loops(lsr)
+
+                return LoopCycles(
+                    loops: oneDayLoops.loops,
+                    errors: oneDayLoops.errors,
+                    readings: Int(oneDayGlucose),
+                    success_rate: oneDayLoops.success_rate,
+                    avg_interval: oneDayLoops.avg_interval,
+                    median_interval: oneDayLoops.median_interval,
+                    min_interval: oneDayLoops.min_interval,
+                    max_interval: oneDayLoops.max_interval,
+                    avg_duration: oneDayLoops.avg_duration,
+                    median_duration: oneDayLoops.median_duration,
+                    min_duration: oneDayLoops.max_duration,
+                    max_duration: oneDayLoops.max_duration
+                )
+            } catch {
+                debugPrint(
+                    "\(DebuggingIdentifiers.failed) \(#file) \(#function) Failed to get Loop statistics for Statistics Upload"
+                )
+                return LoopCycles(
+                    loops: 0,
+                    errors: 0,
+                    readings: 0,
+                    success_rate: 0,
+                    avg_interval: 0,
+                    median_interval: 0,
+                    min_interval: 0,
+                    max_interval: 0,
+                    avg_duration: 0,
+                    median_duration: 0,
+                    min_duration: 0,
+                    max_duration: 0
+                )
+            }
+        }
+    }
+
+    private func glucoseForStats() async -> (
+        oneDayGlucose: (ifcc: Double, ngsp: Double, average: Double, median: Double, sd: Double, cv: Double, readings: Double),
+        eA1cDisplayUnit: EstimatedA1cDisplayUnit,
+        numberofDays: Double,
+        TimeInRange: TIRs,
+        avg: Averages,
+        hbs: Durations,
+        variance: Variance
+    )? {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "glucoseForStats"
+        do {
+            return try await context.perform {
+                // Fetch all windows on the same context so subsequent property access is safe.
+                let glucose24h = try self.fetchGlucose(
+                    on: context,
+                    predicate: NSPredicate.predicateForOneDayAgo,
+                    fetchLimit: 288,
+                    batchSize: 50
+                )
+                let glucoseOneWeek = try self.fetchGlucose(
+                    on: context,
+                    predicate: NSPredicate.predicateForOneWeek,
+                    fetchLimit: 288 * 7,
+                    batchSize: 250
+                )
+                let glucoseOneMonth = try self.fetchGlucose(
+                    on: context,
+                    predicate: NSPredicate.predicateForOneMonth,
+                    fetchLimit: 288 * 7 * 30,
+                    batchSize: 500
+                )
+                let glucoseThreeMonths = try self.fetchGlucose(
+                    on: context,
+                    predicate: NSPredicate.predicateForThreeMonths,
+                    fetchLimit: 288 * 7 * 30 * 3,
+                    batchSize: 1000
+                )
+
+                let units = self.settingsManager.settings.units
+
+                // First date
+                let previous = glucoseThreeMonths.last?.date ?? Date()
+                // Last date (recent)
+                let current = glucoseThreeMonths.first?.date ?? Date()
+                // Total time in days
+                let numberOfDays = (current - previous).timeInterval / 8.64E4
+
+                // Get glucose computations for every case
+                let oneDayGlucose = self.glucoseStats(glucose24h)
+                let sevenDaysGlucose = self.glucoseStats(glucoseOneWeek)
+                let thirtyDaysGlucose = self.glucoseStats(glucoseOneMonth)
+                let totalDaysGlucose = self.glucoseStats(glucoseThreeMonths)
+
+                let median = Durations(
+                    day: self.roundDecimal(Decimal(oneDayGlucose.median), 1),
+                    week: self.roundDecimal(Decimal(sevenDaysGlucose.median), 1),
+                    month: self.roundDecimal(Decimal(thirtyDaysGlucose.median), 1),
+                    total: self.roundDecimal(Decimal(totalDaysGlucose.median), 1)
+                )
+
+                let eA1cDisplayUnit = self.settingsManager.settings.eA1cDisplayUnit
+
+                let hbs = Durations(
+                    day: eA1cDisplayUnit == .mmolMol ?
+                        self.roundDecimal(Decimal(oneDayGlucose.ifcc), 1) :
+                        self.roundDecimal(Decimal(oneDayGlucose.ngsp), 1),
+                    week: eA1cDisplayUnit == .mmolMol ?
+                        self.roundDecimal(Decimal(sevenDaysGlucose.ifcc), 1) :
+                        self.roundDecimal(Decimal(sevenDaysGlucose.ngsp), 1),
+                    month: eA1cDisplayUnit == .mmolMol ?
+                        self.roundDecimal(Decimal(thirtyDaysGlucose.ifcc), 1) :
+                        self.roundDecimal(Decimal(thirtyDaysGlucose.ngsp), 1),
+                    total: eA1cDisplayUnit == .mmolMol ?
+                        self.roundDecimal(Decimal(totalDaysGlucose.ifcc), 1) :
+                        self.roundDecimal(Decimal(totalDaysGlucose.ngsp), 1)
+                )
+
+                var oneDay_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+                var sevenDays_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+                var thirtyDays_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+                var totalDays_: (TIR: Double, hypos: Double, hypers: Double, normal_: Double) = (0.0, 0.0, 0.0, 0.0)
+                // Get TIR computations for every case
+                oneDay_ = self.tir(glucose24h)
+                sevenDays_ = self.tir(glucoseOneWeek)
+                thirtyDays_ = self.tir(glucoseOneMonth)
+                totalDays_ = self.tir(glucoseThreeMonths)
+
+                let tir = Durations(
+                    day: self.roundDecimal(Decimal(oneDay_.TIR), 1),
+                    week: self.roundDecimal(Decimal(sevenDays_.TIR), 1),
+                    month: self.roundDecimal(Decimal(thirtyDays_.TIR), 1),
+                    total: self.roundDecimal(Decimal(totalDays_.TIR), 1)
+                )
+                let hypo = Durations(
+                    day: Decimal(oneDay_.hypos),
+                    week: Decimal(sevenDays_.hypos),
+                    month: Decimal(thirtyDays_.hypos),
+                    total: Decimal(totalDays_.hypos)
+                )
+                let hyper = Durations(
+                    day: Decimal(oneDay_.hypers),
+                    week: Decimal(sevenDays_.hypers),
+                    month: Decimal(thirtyDays_.hypers),
+                    total: Decimal(totalDays_.hypers)
+                )
+                let normal = Durations(
+                    day: Decimal(oneDay_.normal_),
+                    week: Decimal(sevenDays_.normal_),
+                    month: Decimal(thirtyDays_.normal_),
+                    total: Decimal(totalDays_.normal_)
+                )
+                let range = Threshold(
+                    low: units == .mmolL ? self.roundDecimal(self.settingsManager.settings.low.asMmolL, 1) :
+                        self.roundDecimal(self.settingsManager.settings.low, 0),
+                    high: units == .mmolL ? self.roundDecimal(self.settingsManager.settings.high.asMmolL, 1) :
+                        self.roundDecimal(self.settingsManager.settings.high, 0)
+                )
+                let TimeInRange = TIRs(
+                    TIR: tir,
+                    Hypos: hypo,
+                    Hypers: hyper,
+                    Threshold: range,
+                    Euglycemic: normal
+                )
+                let avgs = Durations(
+                    day: self.roundDecimal(Decimal(oneDayGlucose.average), 1),
+                    week: self.roundDecimal(Decimal(sevenDaysGlucose.average), 1),
+                    month: self.roundDecimal(Decimal(thirtyDaysGlucose.average), 1),
+                    total: self.roundDecimal(Decimal(totalDaysGlucose.average), 1)
+                )
+                let avg = Averages(Average: avgs, Median: median)
+                // Standard Deviations
+                let standardDeviations = Durations(
+                    day: self.roundDecimal(Decimal(oneDayGlucose.sd), 1),
+                    week: self.roundDecimal(Decimal(sevenDaysGlucose.sd), 1),
+                    month: self.roundDecimal(Decimal(thirtyDaysGlucose.sd), 1),
+                    total: self.roundDecimal(Decimal(totalDaysGlucose.sd), 1)
+                )
+                // CV = standard deviation / sample mean x 100
+                let cvs = Durations(
+                    day: self.roundDecimal(Decimal(oneDayGlucose.cv), 1),
+                    week: self.roundDecimal(Decimal(sevenDaysGlucose.cv), 1),
+                    month: self.roundDecimal(Decimal(thirtyDaysGlucose.cv), 1),
+                    total: self.roundDecimal(Decimal(totalDaysGlucose.cv), 1)
+                )
+                let variance = Variance(SD: standardDeviations, CV: cvs)
+
+                return (oneDayGlucose, eA1cDisplayUnit, numberOfDays, TimeInRange, avg, hbs, variance)
+            }
+        } catch {
+            debug(
+                .apsManager,
+                "\(DebuggingIdentifiers.failed) Error fetching glucose for stats: \(error)"
+            )
+            return nil
+        }
+    }
+
+    private func loopStats(loopStatRecord: LoopStats) {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "loopStats.save"
+        context.perform {
+            let nLS = LoopStatRecord(context: context)
+            nLS.start = loopStatRecord.start
+            nLS.end = loopStatRecord.end ?? Date()
+            nLS.loopStatus = loopStatRecord.loopStatus
+            nLS.duration = loopStatRecord.duration ?? 0.0
+            nLS.interval = loopStatRecord.interval ?? 0.0
+
+            do {
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch {
+                print(error.localizedDescription)
+            }
+        }
+    }
+
+    private var transientCategoryFirstSeen: [String: Date] = [:]
+    private var transientCategoryCount: [String: Int] = [:]
+    private static let transientDwellThreshold: TimeInterval = 60
+    private static let transientCountThreshold = 2
+
+    /// Set by `markNextLoopUserInitiated()` (e.g. force-loop button), consumed
+    /// on the next entry into `loop()` so that errors during a user-initiated
+    /// loop surface immediately instead of being suppressed by dwell logic.
+    @SyncAccess private var nextLoopUserInitiated: Bool = false
+    private var currentLoopUserInitiated: Bool = false
+
+    func markNextLoopUserInitiated() {
+        nextLoopUserInitiated = true
+    }
+
+    private func processError(_ error: Error) {
+        warning(.apsManager, "\(error)")
+        lastError.send(error)
+        surfaceErrorIfNeeded(error)
+    }
+
+    private func surfaceErrorIfNeeded(_ error: Error) {
+        let category = TrioAlertClassifier.categorize(error: error)
+        let key = String(describing: category)
+
+        if category.shouldFireImmediately || currentLoopUserInitiated {
+            transientCategoryFirstSeen.removeValue(forKey: key)
+            transientCategoryCount.removeValue(forKey: key)
+            issueAlertForError(error, category: category)
+            return
+        }
+
+        let now = Date()
+        let firstSeen = transientCategoryFirstSeen[key] ?? now
+        let count = (transientCategoryCount[key] ?? 0) + 1
+        let dwellElapsed = now.timeIntervalSince(firstSeen)
+        let dwellMet = dwellElapsed >= Self.transientDwellThreshold
+        let countMet = count >= Self.transientCountThreshold
+
+        if dwellMet || countMet {
+            transientCategoryFirstSeen.removeValue(forKey: key)
+            transientCategoryCount.removeValue(forKey: key)
+            issueAlertForError(error, category: category)
+        } else {
+            transientCategoryFirstSeen[key] = firstSeen
+            transientCategoryCount[key] = count
+            debug(
+                .apsManager,
+                "APSManager suppressed transient \(category) (count=\(count)/\(Self.transientCountThreshold), dwell=\(Int(dwellElapsed))s/\(Int(Self.transientDwellThreshold))s)"
+            )
+        }
+    }
+
+    private func issueAlertForCategory(_ category: TrioAlertCategory, title: String, body: String) {
+        let content = Alert.Content(
+            title: title,
+            body: body,
+            acknowledgeActionButtonLabel: String(localized: "OK")
+        )
+        let alert = Alert(
+            identifier: Alert.Identifier(managerIdentifier: "trio.aps", alertIdentifier: category.alertIdentifier),
+            foregroundContent: content,
+            backgroundContent: content,
+            trigger: .immediate,
+            interruptionLevel: category.interruptionLevel
+        )
+        trioAlertManager?.issueAlert(alert)
+    }
+
+    private func issueAlertForError(_ error: Error, category: TrioAlertCategory) {
+        let (title, body) = describeForAlert(error)
+        let content = Alert.Content(
+            title: title,
+            body: body,
+            acknowledgeActionButtonLabel: "OK"
+        )
+        let alert = Alert(
+            identifier: Alert.Identifier(managerIdentifier: "trio.aps", alertIdentifier: category.alertIdentifier),
+            foregroundContent: content,
+            backgroundContent: content,
+            trigger: .immediate,
+            interruptionLevel: category.interruptionLevel
+        )
+        trioAlertManager?.issueAlert(alert)
+    }
+
+    private func describeForAlert(_ error: Error) -> (title: String, body: String) {
+        if let apsError = error as? APSError {
+            switch apsError {
+            case let .pumpError(inner):
+                return (
+                    String(localized: "Pump Error"),
+                    String(localized: "Trio could not communicate with the pump. Check the pump and try again.")
+                        + "\n\n\(inner.localizedDescription)"
+                )
+            case let .invalidPumpState(message): return (String(localized: "Pump State Error"), message)
+            case let .glucoseError(message): return (String(localized: "Glucose Error"), message)
+            case let .apsError(message): return (String(localized: "Algorithm Error"), message)
+            case let .manualBasalTemp(message): return (String(localized: "Manual Temp Basal Active"), message)
+            }
+        }
+        return ("Trio", error.localizedDescription)
+    }
+
+    /// Called from the `bolusTrigger` Combine sink (already on
+    /// `processQueue`) and from `doseProgressReporterDidUpdate` (the
+    /// pump manager schedules the callback on `processQueue` too).
+    /// Mutations are dispatched onto the queue regardless, so a future
+    /// caller from another context (e.g. `cancelBolus`) stays safe.
+    private func createBolusReporter() {
+        if bolusReporter != nil {
+            return
+        }
+
+        processQueue.async {
+            self.bolusReporter = self.pumpManager?.createBolusProgressReporter(reportingOn: self.processQueue)
+            self.bolusReporter?.addObserver(self)
+        }
+    }
+
+    private func clearBolusReporter() {
+        processQueue.async {
+            self.bolusReporter?.removeObserver(self)
+            self.bolusReporter = nil
+            self.bolusProgress.send(nil)
+        }
+    }
+}
+
+private extension PumpManager {
+    func enactTempBasal(unitsPerHour: Double, for duration: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.enactTempBasal(unitsPerHour: unitsPerHour, for: duration) { error in
+                if let error = error {
+                    debug(.apsManager, "Temp basal failed: \(unitsPerHour) for: \(duration)")
+                    continuation.resume(throwing: error)
+                } else {
+                    debug(.apsManager, "Temp basal succeeded: \(unitsPerHour) for: \(duration)")
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    func enactBolus(units: Double, automatic: Bool) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let automaticValue = automatic ? BolusActivationType.automatic : BolusActivationType.manualRecommendationAccepted
+
+            self.enactBolus(units: units, activationType: automaticValue) { error in
+                if let error = error {
+                    debug(.apsManager, "Bolus failed: \(units)")
+                    continuation.resume(throwing: error)
+                } else {
+                    debug(.apsManager, "Bolus succeeded: \(units)")
+                    continuation.resume(returning: ())
+                }
+            }
+        }
+    }
+
+    func cancelBolus() async throws -> DoseEntry? {
+        try await withCheckedThrowingContinuation { continuation in
+            self.cancelBolus { result in
+                switch result {
+                case let .success(dose):
+                    debug(.apsManager, "Cancel Bolus succeeded")
+                    continuation.resume(returning: dose)
+                case let .failure(error):
+                    debug(.apsManager, "Cancel Bolus failed")
+                    continuation.resume(throwing: APSError.pumpError(error))
+                }
+            }
+        }
+    }
+
+    func suspendDelivery() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.suspendDelivery { error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    func resumeDelivery() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.resumeDelivery { error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+}
+
+extension BaseAPSManager: SettingsObserver {
+    func settingsDidChange(_ settings: TrioSettings) {
+        let previous = lastDosingMode
+        lastDosingMode = settings.dosingMode
+
+        // Only basal testing clears a running temp. Elsewhere it may be protecting against a low,
+        // and dropping back to scheduled basal would remove that protection.
+        guard settings.dosingMode == .basalTesting, previous != .basalTesting else { return }
+
+        Task { await cancelAutomaticTempBasal() }
+    }
+
+    /// Clears a Trio-set temp so a basal test starts from the scheduled rate.
+    private func cancelAutomaticTempBasal() async {
+        guard let pump = pumpManager else { return }
+
+        // A temp the user set on the pump is theirs to cancel.
+        guard !isManualTempBasal else { return }
+        guard case let .tempBasal(dose) = pump.status.basalDeliveryState, dose.automatic ?? true else { return }
+
+        do {
+            try await pump.enactTempBasal(unitsPerHour: 0, for: 0)
+            debug(.apsManager, "Cancelled temp basal for basal testing")
+        } catch {
+            debug(.apsManager, "Failed to cancel temp basal for basal testing: \(error)")
+            processError(APSError.pumpError(error))
+        }
+    }
+}
+
+extension BaseAPSManager: PumpManagerStatusObserver {
+    func pumpManager(_: PumpManager, didUpdate status: PumpManagerStatus, oldStatus _: PumpManagerStatus) {
+        let percent = Int((status.pumpBatteryChargeRemaining ?? 1) * 100)
+
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "storeBatteryStatus"
+        context.perform {
+            /// only update the last item with the current battery infos instead of saving a new one each time
+            let fetchRequest: NSFetchRequest<OpenAPS_Battery> = OpenAPS_Battery.fetchRequest()
+            fetchRequest.sortDescriptors = [NSSortDescriptor(key: "date", ascending: false)]
+            fetchRequest.predicate = NSPredicate.predicateFor30MinAgo
+            fetchRequest.fetchLimit = 1
+
+            do {
+                let results = try context.fetch(fetchRequest)
+                let batteryToStore: OpenAPS_Battery
+
+                if let existingBattery = results.first {
+                    batteryToStore = existingBattery
+                } else {
+                    batteryToStore = OpenAPS_Battery(context: context)
+                    batteryToStore.id = UUID()
+                }
+
+                batteryToStore.date = Date()
+                batteryToStore.percent = Double(percent)
+                batteryToStore.voltage = nil
+                batteryToStore.status = percent > 10 ? "normal" : "low"
+                batteryToStore.display = status.pumpBatteryChargeRemaining != nil
+
+                guard context.hasChanges else { return }
+                try context.save()
+            } catch {
+                debug(.apsManager, "Failed to fetch or save battery: \(error)")
+            }
+        }
+        // TODO: - remove this after ensuring that NS still gets the same infos from Core Data
+        storage.save(status.pumpStatus, as: OpenAPS.Monitor.status)
+    }
+}
+
+extension BaseAPSManager: DoseProgressObserver {
+    func doseProgressReporterDidUpdate(_ doseProgressReporter: DoseProgressReporter) {
+        bolusProgress.send(Decimal(doseProgressReporter.progress.percentComplete))
+        if doseProgressReporter.progress.isComplete {
+            clearBolusReporter()
+        }
+    }
+}
+
+extension PumpManagerStatus {
+    var pumpStatus: PumpStatus {
+        let bolusing = bolusState != .noBolus
+        let suspended = basalDeliveryState?.isSuspended ?? true
+        let type = suspended ? StatusType.suspended : (bolusing ? .bolusing : .normal)
+        return PumpStatus(status: type, bolusing: bolusing, suspended: suspended, timestamp: Date())
+    }
+}
