@@ -7,14 +7,25 @@ extension NightscoutConfig {
         let resolver: Resolver
         let displayClose: Bool
         @StateObject var state = StateModel()
-        @State private var shouldDisplayHint: Bool = false
         @State var hintDetent = PresentationDetent.large
-        @State var selectedVerboseHint: AnyView?
-        @State var hintLabel: String?
+        @State private var hintPayload: HintPayload?
         @State private var decimalPlaceholder: Decimal = 0.0
         @State private var booleanPlaceholder: Bool = false
         @State var backfillAlert: Alert?
         @State var isBackfillAlertPresented = false
+
+        private struct HintPayload: Identifiable {
+            let id = UUID()
+            let label: String
+            let content: AnyView
+        }
+
+        private var shouldDisplayHintBinding: Binding<Bool> {
+            Binding(
+                get: { hintPayload != nil },
+                set: { newValue in if !newValue { hintPayload = nil } }
+            )
+        }
 
         @Environment(\.colorScheme) var colorScheme
         @Environment(AppState.self) var appState
@@ -37,7 +48,14 @@ extension NightscoutConfig {
                                             Image(systemName: "network.slash")
                                         }
                                     }
+                                    .accessibilityHidden(true)
                                 }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityValue(Text(
+                                    state.isConnectedToNS
+                                        ? String(localized: "connected", comment: "Accessibility: connection state")
+                                        : String(localized: "not connected", comment: "Accessibility: connection state")
+                                ))
                             })
                             NavigationLink("Upload", destination: NightscoutUploadView(state: state))
                             NavigationLink("Fetch", destination: NightscoutFetchView(state: state))
@@ -79,18 +97,19 @@ extension NightscoutConfig {
                                     Spacer()
                                     Button(
                                         action: {
-                                            hintLabel = String(localized: "Backfill Glucose from Nightscout")
-                                            selectedVerboseHint =
-                                                AnyView(
+                                            hintPayload = HintPayload(
+                                                label: String(localized: "Backfill Glucose from Nightscout"),
+                                                content: AnyView(
                                                     Text(
                                                         "This will backfill 24 hours of glucose data from your connected Nightscout URL to Trio"
                                                     )
                                                 )
-                                            shouldDisplayHint.toggle()
+                                            )
                                         },
                                         label: {
                                             HStack {
                                                 Image(systemName: "questionmark.circle")
+                                                    .accessibilityLabel(Text("More information"))
                                             }
                                         }
                                     ).buttonStyle(BorderlessButtonStyle())
@@ -104,12 +123,12 @@ extension NightscoutConfig {
                 }
                 .listSectionSpacing(sectionSpacing)
             }
-            .sheet(isPresented: $shouldDisplayHint) {
+            .sheet(item: $hintPayload) { payload in
                 SettingInputHintView(
                     hintDetent: $hintDetent,
-                    shouldDisplayHint: $shouldDisplayHint,
-                    hintLabel: hintLabel ?? "",
-                    hintText: selectedVerboseHint ?? AnyView(EmptyView()),
+                    shouldDisplayHint: shouldDisplayHintBinding,
+                    hintLabel: payload.label,
+                    hintText: payload.content,
                     sheetTitle: String(localized: "Help", comment: "Help sheet title")
                 )
             }

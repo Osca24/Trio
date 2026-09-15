@@ -11,8 +11,11 @@ protocol CarbsObserver {
 protocol CarbsStorage {
     var updatePublisher: AnyPublisher<Void, Never> { get }
     func storeCarbs(_ carbs: [CarbsEntry], areFetchedFromRemote: Bool) async throws
+    /// Builds a single, real, locally-entered carb entry ready to pass to `storeCarbs`.
+    func makeCarbEntry(carbs: Decimal, date: Date) -> CarbsEntry
     func deleteCarbsEntryStored(_ treatmentObjectID: NSManagedObjectID) async
     func syncDate() -> Date
+    func getCarbsForAlgorithm(additionalCarbs: Decimal?, carbsDate: Date?) async throws -> [CarbsEntry]
     func getCarbsNotYetUploadedToNightscout() async throws -> [NightscoutTreatment]
     func getFPUsNotYetUploadedToNightscout() async throws -> [NightscoutTreatment]
     func getCarbsNotYetUploadedToHealth() async throws -> [CarbsEntry]
@@ -33,10 +36,10 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
         updateSubject.eraseToAnyPublisher()
     }
 
-    private let context: NSManagedObjectContext
+    private let makeContext: () -> NSManagedObjectContext
 
-    init(resolver: Resolver, context: NSManagedObjectContext? = nil) {
-        self.context = context ?? CoreDataStack.shared.newTaskContext()
+    init(resolver: Resolver, contextProvider: (() -> NSManagedObjectContext)? = nil) {
+        makeContext = contextProvider ?? { CoreDataStack.shared.newTaskContext() }
         injectServices(resolver)
     }
 
@@ -74,6 +77,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     private func filterRemoteEntries(entries: [CarbsEntry]) async throws -> [CarbsEntry] {
+        let context = makeContext()
+        context.name = "filterRemoteEntries"
         // Fetch only the date property from Core Data
         guard let existing24hCarbEntries = try await CoreDataStack.shared.fetchEntitiesAsync(
             ofType: CarbEntryStored.self,
@@ -102,38 +107,40 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     /**
-     Calculates the duration for processing FPUs (fat and protein units) based on the FPUs and the time cap.
+     Converts fat and protein into delayed carb-equivalent entries (FPU handling).
 
-     - The function uses predefined rules to determine the duration based on the number of FPUs.
-     - Ensures that the duration does not exceed the time cap.
+     Behavior:
+
+     - Calculates carb equivalents from fat and protein
+       ((fat × 9 + protein × 4) / 10 × adjustment factor).
+     - Rounds down to whole grams.
+     - Drops values below 10 g.
+     - Caps total equivalents at 99 g.
+     - Splits into up to 3 entries.
+     - Caps each entry at 33 g.
+     - Distributes grams as evenly as possible.
+
+     Timing:
+
+     - First entry is scheduled after the configured delay
+       (default: 60 minutes) from the carb entry timestamp.
+     - Additional entries are spaced 30 minutes apart.
+
+     Example (default):
+
+     - Carb entry at T
+     - 1st equivalent at T + 60 min
+     - 2nd equivalent at T + 90 min
+     - 3rd equivalent at T + 120 min
+
+     Generated entries:
+
+     - Are marked with `isFPU = true`
+     - Contain only carbs (fat and protein set to 0)
+     - Share the same `fpuID` as the original carb entry
 
      - Parameters:
-       - fpus: The number of FPUs calculated from fat and protein.
-       - timeCap: The maximum allowed duration.
-
-     - Returns: The computed duration in hours.
-     */
-    private func calculateComputedDuration(fpus: Decimal, timeCap: Decimal) -> Decimal {
-        switch fpus {
-        case ..<2:
-            return 3
-        case 2 ..< 3:
-            return 4
-        case 3 ..< 4:
-            return 5
-        default:
-            return timeCap
-        }
-    }
-
-    /**
-     Processes fat and protein entries to generate future carb equivalents, ensuring each equivalent is at least 1.0 grams.
-
-     - The function calculates the equivalent carb dosage size and adjusts the interval to ensure each equivalent is at least 1.0 grams.
-     - Creates future carb entries based on the adjusted carb equivalent size and interval.
-
-     - Parameters:
-       - entries: An array of `CarbsEntry` objects representing the carbohydrate entries to be processed.
+       - entries: An array of `CarbsEntry` objects representing the carb equivalent entries to be processed.
        - fat: The amount of fat in the last entry.
        - protein: The amount of protein in the last entry.
        - createdAt: The creation date of the last entry.
@@ -150,46 +157,48 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
         let trioSettings = settings.settings
         let providerSettings = settingsProvider.settings
 
-        let interval = trioSettings.minuteInterval.clamp(to: providerSettings.minuteInterval)
-        let timeCap = trioSettings.timeCap.clamp(to: providerSettings.timeCap)
-        let adjustment = trioSettings.individualAdjustmentFactor.clamp(to: providerSettings.individualAdjustmentFactor)
-        let delay = trioSettings.delay.clamp(to: providerSettings.delay)
+        let adjustment = trioSettings.individualAdjustmentFactor
+            .clamp(to: providerSettings.individualAdjustmentFactor)
 
+        let delayMinutes = trioSettings.delay
+            .clamp(to: providerSettings.delay)
+
+        let spreadInterval = trioSettings.minuteInterval
+            .clamp(to: providerSettings.minuteInterval)
+
+        // Constraints
+        let maxTotalGrams = 99
+        let maxEntries = 3
+        let maxPerEntry = 33
+        let minPerEntry = 10
+        let spacing = TimeInterval(spreadInterval * 60)
+
+        // kcal -> carb equivalents (kcal/10 * adjustment), rounded down to whole grams
         let kcal = protein * 4 + fat * 9
-        let carbEquivalents = (kcal / 10) * adjustment
-        let fpus = carbEquivalents / 10
-        var computedDuration = calculateComputedDuration(fpus: fpus, timeCap: timeCap)
+        let rawEquivalents = Int((kcal / 10) * adjustment)
+        let totalGrams = min(maxTotalGrams, max(0, rawEquivalents))
 
-        var carbEquivalentSize: Decimal = carbEquivalents / computedDuration
-        carbEquivalentSize /= Decimal(60) / interval
-
-        if carbEquivalentSize < 1.0 {
-            carbEquivalentSize = 1.0
-            computedDuration = min(carbEquivalents / carbEquivalentSize, timeCap)
+        guard totalGrams >= minPerEntry else {
+            return ([], Decimal(totalGrams))
         }
 
-        let roundedEquivalent: Double = round(Double(carbEquivalentSize * 10)) / 10
-        carbEquivalentSize = Decimal(roundedEquivalent)
-        var numberOfEquivalents = carbEquivalents / carbEquivalentSize
+        let amounts = splitIntoCarbEquivalents(
+            total: totalGrams,
+            maxEntries: maxEntries,
+            maxPerEntry: maxPerEntry,
+            minPerEntry: minPerEntry
+        )
 
-        var useDate = actualDate ?? createdAt
+        let baseDate = actualDate ?? createdAt
+        let start = baseDate.addingTimeInterval(TimeInterval(delayMinutes * 60))
         let fpuID = entries.first?.fpuID ?? UUID().uuidString
-        var futureCarbArray = [CarbsEntry]()
-        var firstIndex = true
 
-        // convert Decimal minutes to TimeInterval in seconds
-        let delayTimeInterval = TimeInterval(delay * 60)
-        let intervalTimeInterval = TimeInterval(interval * 60)
-        while carbEquivalents > 0, numberOfEquivalents > 0 {
-            useDate = firstIndex ? useDate.addingTimeInterval(delayTimeInterval) : useDate
-                .addingTimeInterval(intervalTimeInterval)
-            firstIndex = false
-
-            let eachCarbEntry = CarbsEntry(
+        let futureEntries: [CarbsEntry] = amounts.enumerated().map { idx, grams in
+            CarbsEntry(
                 id: UUID().uuidString,
                 createdAt: createdAt,
-                actualDate: useDate,
-                carbs: carbEquivalentSize,
+                actualDate: start.addingTimeInterval(TimeInterval(idx) * spacing),
+                carbs: Decimal(grams),
                 fat: 0,
                 protein: 0,
                 note: nil,
@@ -197,11 +206,62 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
                 isFPU: true,
                 fpuID: fpuID
             )
-            futureCarbArray.append(eachCarbEntry)
-            numberOfEquivalents -= 1
         }
 
-        return (futureCarbArray, carbEquivalents)
+        let totalScheduled = futureEntries.reduce(into: Decimal(0)) { $0 += $1.carbs }
+        return (futureEntries, totalScheduled)
+    }
+
+    /**
+     Splits a total carb-equivalent value into multiple integer entries.
+
+     - Returns no entries if `total` is below `minPerEntry`.
+     - Limits output to `maxEntries`.
+     - Caps each entry at `maxPerEntry`.
+     - Distributes grams evenly (difference ≤ 1 g).
+     - Merges or removes entries below `minPerEntry`.
+
+     - Returns:
+       Integer gram values representing the split carb equivalents.
+     */
+    private func splitIntoCarbEquivalents(
+        total: Int,
+        maxEntries: Int,
+        maxPerEntry: Int,
+        minPerEntry: Int
+    ) -> [Int] {
+        guard total >= minPerEntry else { return [] }
+
+        // Choose an entry count that *guarantees* each entry can be <= maxPerEntry
+        let needed = (total + maxPerEntry - 1) / maxPerEntry
+        let count = min(maxEntries, max(1, needed))
+
+        // Even split (difference between buckets is at most 1)
+        func evenSplit(_ total: Int, count: Int) -> [Int] {
+            let base = total / count
+            let rem = total % count
+            return (0 ..< count).map { base + ($0 < rem ? 1 : 0) }
+        }
+
+        var buckets = evenSplit(total, count: count)
+
+        // Enforce minPerEntry by merging any too-small tail bucket into the previous one
+        // This should be rare, but it keeps the invariant
+        if buckets.count > 1 {
+            for i in stride(from: buckets.count - 1, through: 1, by: -1) {
+                let v = buckets[i]
+                guard v > 0, v < minPerEntry else { continue }
+                buckets[i - 1] += v
+                buckets[i] = 0
+            }
+            buckets = buckets.filter { $0 > 0 }
+        }
+
+        // Guarantee not to exceed maxPerEntry if merging a reduced count
+        // Clamp as final guard here
+        buckets = buckets.map { min(maxPerEntry, $0) }.filter { $0 >= minPerEntry }
+
+        return buckets
     }
 
     private func saveCarbEquivalents(entries: [CarbsEntry], areFetchedFromRemote: Bool) async {
@@ -225,8 +285,10 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     private func saveCarbsToCoreData(entries: [CarbsEntry], areFetchedFromRemote: Bool) async {
         guard let entry = entries.last else { return }
 
+        let context = makeContext()
+        context.name = "saveCarbsToCoreData"
         await context.perform {
-            let newItem = CarbEntryStored(context: self.context)
+            let newItem = CarbEntryStored(context: context)
             newItem.date = entry.actualDate ?? entry.createdAt
             newItem.carbs = Double(truncating: NSDecimalNumber(decimal: entry.carbs))
             newItem.fat = Double(truncating: NSDecimalNumber(decimal: entry.fat ?? 0))
@@ -243,8 +305,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
             }
 
             do {
-                guard self.context.hasChanges else { return }
-                try self.context.save()
+                guard context.hasChanges else { return }
+                try context.save()
             } catch {
                 print(error.localizedDescription)
             }
@@ -272,9 +334,11 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
             // do NOT set Health and Tidepool flags to ensure they will NOT be uploaded
             return false // return false to continue
         }
+        let context = makeContext()
+        context.name = "saveFPUToCoreDataAsBatchInsert"
         await context.perform {
             do {
-                try self.context.execute(batchInsert)
+                try context.execute(batchInsert)
                 debugPrint("Carbs Storage: \(DebuggingIdentifiers.succeeded) saved fpus to core data")
 
                 // Notify subscriber in Home State Model to update the FPU Array
@@ -289,20 +353,94 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
         Date().addingTimeInterval(-1.days.timeInterval)
     }
 
-    func deleteCarbsEntryStored(_ treatmentObjectID: NSManagedObjectID) async {
-        // Use injected context if available, otherwise create new task context
-        let taskContext = context != CoreDataStack.shared.newTaskContext()
-            ? context
-            : CoreDataStack.shared.newTaskContext()
+    /// Fetches the last day of carbs and converts them into the `CarbsEntry` values the oref algorithm
+    /// consumes, optionally appending a synthetic "additional carbs" entry for bolus simulation.
+    func getCarbsForAlgorithm(additionalCarbs: Decimal? = nil, carbsDate: Date? = nil) async throws -> [CarbsEntry] {
+        let context = makeContext()
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: CarbEntryStored.self,
+            onContext: context,
+            predicate: NSPredicate.predicateForOneDayAgo,
+            key: "date",
+            ascending: false
+        )
 
-        taskContext.name = "deleteContext"
-        taskContext.transactionAuthor = "deleteCarbs"
+        return try await context.perform {
+            guard let carbResults = results as? [CarbEntryStored] else {
+                throw CoreDataError.fetchError(function: #function, file: #file)
+            }
+
+            var entries = carbResults.map { Self.mapToCarbsEntry($0) }
+
+            if let additionalCarbs = additionalCarbs {
+                entries.append(Self.additionalCarbsEntry(carbs: additionalCarbs, date: carbsDate ?? Date()))
+            }
+
+            return entries
+        }
+    }
+
+    /// Converts CoreData stored carb entries into a struct that the oref algorithm can use
+    static func mapToCarbsEntry(_ carbEntry: CarbEntryStored) -> CarbsEntry {
+        // The old encode used `date ?? Date()` for both created_at and actualDate.
+        let date = carbEntry.date ?? Date()
+        return CarbsEntry(
+            id: carbEntry.id?.uuidString,
+            createdAt: date,
+            actualDate: date,
+            carbs: Decimal(algorithmValue: carbEntry.carbs),
+            fat: Decimal(algorithmValue: carbEntry.fat),
+            protein: Decimal(algorithmValue: carbEntry.protein),
+            note: nil,
+            enteredBy: CarbsEntry.local,
+            isFPU: carbEntry.isFPU,
+            fpuID: nil
+        )
+    }
+
+    /// Builds the synthetic "additional carbs" entry that the determine-basal flow appends for bolus
+    /// simulation.
+    static func additionalCarbsEntry(carbs: Decimal, date: Date, id: String = UUID().uuidString) -> CarbsEntry {
+        CarbsEntry(
+            id: id,
+            createdAt: date,
+            actualDate: date,
+            carbs: carbs,
+            fat: 0,
+            protein: 0,
+            note: nil,
+            enteredBy: CarbsEntry.local,
+            isFPU: false,
+            fpuID: nil
+        )
+    }
+
+    /// Builds a single, real, locally-entered carb entry ready to pass to `storeCarbs`. Kept separate from
+    /// `additionalCarbsEntry`, which is for the determine-basal flow's synthetic bolus-simulation input.
+    func makeCarbEntry(carbs: Decimal, date: Date) -> CarbsEntry {
+        CarbsEntry(
+            id: UUID().uuidString,
+            createdAt: date,
+            actualDate: date,
+            carbs: carbs,
+            fat: 0,
+            protein: 0,
+            note: nil,
+            enteredBy: CarbsEntry.local,
+            isFPU: false,
+            fpuID: nil
+        )
+    }
+
+    func deleteCarbsEntryStored(_ treatmentObjectID: NSManagedObjectID) async {
+        let context = makeContext()
+        context.name = "deleteCarbsEntryStored"
 
         var carbEntryFromCoreData: CarbEntryStored?
 
-        await taskContext.perform {
+        await context.perform {
             do {
-                carbEntryFromCoreData = try taskContext.existingObject(with: treatmentObjectID) as? CarbEntryStored
+                carbEntryFromCoreData = try context.existingObject(with: treatmentObjectID) as? CarbEntryStored
                 guard let carbEntry = carbEntryFromCoreData else {
                     debugPrint("Carb entry for batch delete not found. \(DebuggingIdentifiers.failed)")
                     return
@@ -322,7 +460,7 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
                     deleteRequest.resultType = .resultTypeCount
 
                     // execute the batch delete request
-                    let result = try taskContext.execute(deleteRequest) as? NSBatchDeleteResult
+                    let result = try context.execute(deleteRequest) as? NSBatchDeleteResult
                     debugPrint("\(DebuggingIdentifiers.succeeded) Deleted \(result?.result ?? 0) items with FpuID \(fpuID)")
 
                     // Notifiy subscribers of the batch delete
@@ -331,10 +469,10 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
                 // entry has no fpuID
                 // => it's a carb-only entry. use its ID to for deletion
                 else {
-                    taskContext.delete(carbEntry)
+                    context.delete(carbEntry)
 
-                    guard taskContext.hasChanges else { return }
-                    try taskContext.save()
+                    guard context.hasChanges else { return }
+                    try context.save()
 
                     debugPrint(
                         "CarbsStorage: \(#function) \(DebuggingIdentifiers.succeeded) deleted carb entry from core data"
@@ -348,6 +486,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     func getCarbsNotYetUploadedToNightscout() async throws -> [NightscoutTreatment] {
+        let context = makeContext()
+        context.name = "getCarbsNotYetUploadedToNightscout"
         let results = try await CoreDataStack.shared.fetchEntitiesAsync(
             ofType: CarbEntryStored.self,
             onContext: context,
@@ -387,6 +527,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     func getFPUsNotYetUploadedToNightscout() async throws -> [NightscoutTreatment] {
+        let context = makeContext()
+        context.name = "getFPUsNotYetUploadedToNightscout"
         let results = try await CoreDataStack.shared.fetchEntitiesAsync(
             ofType: CarbEntryStored.self,
             onContext: context,
@@ -426,6 +568,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     func getCarbsNotYetUploadedToHealth() async throws -> [CarbsEntry] {
+        let context = makeContext()
+        context.name = "getCarbsNotYetUploadedToHealth"
         let results = try await CoreDataStack.shared.fetchEntitiesAsync(
             ofType: CarbEntryStored.self,
             onContext: context,
@@ -457,6 +601,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
     }
 
     func getCarbsNotYetUploadedToTidepool() async throws -> [CarbsEntry] {
+        let context = makeContext()
+        context.name = "getCarbsNotYetUploadedToTidepool"
         let results = try await CoreDataStack.shared.fetchEntitiesAsync(
             ofType: CarbEntryStored.self,
             onContext: context,

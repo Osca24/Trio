@@ -1,3 +1,5 @@
+import CoreData
+import Foundation
 import LoopKit
 import LoopKitUI
 import SwiftUI
@@ -10,9 +12,11 @@ extension Settings {
         @Injected() private var nightscoutManager: NightscoutManager!
         @Injected() var pluginManager: PluginManager!
         @Injected() var fetchCgmManager: FetchGlucoseManager!
+        @Injected() private var storage: FileStorage!
+        @Injected() var overrideStorage: OverrideStorage!
 
         @Published var units: GlucoseUnits = .mgdL
-        @Published var closedLoop = false
+        @Published var dosingMode: DosingMode = .open
         @Published var debugOptions = false
         @Published var serviceUIType: ServiceUI.Type?
         @Published var setupTidepool = false
@@ -26,8 +30,7 @@ extension Settings {
             units = settingsManager.settings.units
 
             subscribeSetting(\.debugOptions, on: $debugOptions) { debugOptions = $0 }
-            subscribeSetting(\.closedLoop, on: $closedLoop) { closedLoop = $0 }
-
+            subscribeSetting(\.dosingMode, on: $dosingMode) { dosingMode = $0 }
             broadcaster.register(SettingsObserver.self, observer: self)
 
             buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "Unknown"
@@ -85,7 +88,7 @@ extension Settings {
 
 extension Settings.StateModel: SettingsObserver {
     func settingsDidChange(_ settings: TrioSettings) {
-        closedLoop = settings.closedLoop
+        dosingMode = settings.dosingMode
         debugOptions = settings.debugOptions
     }
 }

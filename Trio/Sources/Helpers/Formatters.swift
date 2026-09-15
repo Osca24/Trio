@@ -1,5 +1,4 @@
 import Foundation
-import HealthKit
 
 enum Formatters {
     static func percent(for number: Double) -> String {
@@ -57,6 +56,13 @@ extension Formatter {
         return formatter
     }()
 
+    static let timeForLogFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        formatter.timeZone = TimeZone.current
+        return formatter
+    }()
+
     static let decimalFormatterWithOneFractionDigit: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -93,7 +99,7 @@ extension Formatter {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
         formatter.locale = .current
-        formatter.minimumIntegerDigits = 0
+        formatter.minimumIntegerDigits = 1
         formatter.maximumFractionDigits = 2
         return formatter
     }()

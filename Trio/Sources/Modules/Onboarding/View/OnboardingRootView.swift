@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Swinject
+import UIKit
 
 /// The main onboarding view that manages navigation between onboarding steps.
 extension Onboarding {
@@ -26,8 +27,7 @@ extension Onboarding {
 
         private func updateCurrentChapter() {
             switch currentStep {
-            case .diagnostics,
-                 .nightscout,
+            case .nightscout,
                  .unitSelection:
                 currentChapter = .prepareTrio
             case .basalRates,
@@ -71,9 +71,7 @@ extension Onboarding {
 
         // Next button conditional
         private var shouldDisableNextButton: Bool {
-            (currentStep == .diagnostics && state.diagnosticsSharingOption == .enabled && !state.hasAcceptedPrivacyPolicy)
-                ||
-                (currentStep == .nightscout && didSelectNightscoutSetupOption)
+            (currentStep == .nightscout && didSelectNightscoutSetupOption)
                 ||
                 (currentStep == .nightscout && hasValidNightscoutConnection)
                 ||
@@ -242,6 +240,19 @@ struct OnboardingProgressBar: View {
                 }
             }
         }.padding(.horizontal)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(progressAccessibilityLabel))
+    }
+
+    private var progressAccessibilityLabel: String {
+        let chapterCount = OnboardingChapter.allCases.count
+        let chapter = String(
+            format: String(localized: "Chapter %1$d of %2$d, %3$@", comment: "Accessibility: onboarding progress"),
+            currentChapter.rawValue + 1,
+            chapterCount,
+            currentChapter.title
+        )
+        return chapter
     }
 
     private var renderedSteps: [(id: String, step: OnboardingStep, substeps: Int?)] {
@@ -296,6 +307,19 @@ struct OnboardingStepContent: View {
     @Binding var currentTargetBehaviorSubstep: TargetBehaviorSubstep
     @Bindable var state: Onboarding.StateModel
     var navigationDirection: OnboardingNavigationDirection
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
+
+    private var transition: AnyTransition {
+        if reduceMotion {
+            return .opacity
+        }
+        switch navigationDirection {
+        case .forward:
+            return .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading))
+        case .backward:
+            return .asymmetric(insertion: .move(edge: .leading), removal: .move(edge: .trailing))
+        }
+    }
 
     var body: some View {
         ScrollViewReader { scrollProxy in
@@ -325,8 +349,6 @@ struct OnboardingStepContent: View {
                                 }
                             case .overview:
                                 OverviewStepView()
-                            case .diagnostics:
-                                DiagnosticsStepView(state: state)
                             case .nightscout:
                                 switch currentNightscoutSubstep {
                                 case .setupSelection:
@@ -377,25 +399,29 @@ struct OnboardingStepContent: View {
                                 CompletedStepView(isOnboardingCompleted: true, currentChapter: nil)
                             }
                         }
-                        .transition(
-                            navigationDirection == .forward
-                                ? .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading))
-                                : .asymmetric(insertion: .move(edge: .leading), removal: .move(edge: .trailing))
-                        )
+                        .transition(transition)
                         .padding(.horizontal)
                         .id(currentStep.id)
                     }
                 }
                 .padding(.bottom, 80)
             }
-            .onChange(of: currentStep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentStartupSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentNightscoutSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentDeliverySubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentAlgorithmSettingsOverviewSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentAutosensSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentSMBSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
-            .onChange(of: currentTargetBehaviorSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top) }
+            .onChange(of: currentStep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentStartupSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentNightscoutSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentDeliverySubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentAlgorithmSettingsOverviewSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentAutosensSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentSMBSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
+            .onChange(of: currentTargetBehaviorSubstep) { _, _ in scrollProxy.scrollTo("top", anchor: .top)
+                announceScreenChange() }
             .safeAreaInset(edge: .top) {
                 // avoid letting content scroll beneath the status bar / dynamic island for content views with not progress bar (which adds top spacing)
                 if currentStep == .startupInfo || currentStep == .completed {
@@ -405,32 +431,43 @@ struct OnboardingStepContent: View {
         }
     }
 
+    /// Move VoiceOver focus back to the top of the new step; otherwise focus stays on the
+    /// "Next" button and the user must navigate backwards to reach the new content.
+    private func announceScreenChange() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            UIAccessibility.post(notification: .screenChanged, argument: nil)
+        }
+    }
+
     private var contentHeader: some View {
         HStack {
-            if currentStep == .nightscout {
-                Image(currentStep.iconName)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 60, height: 60)
-            } else if currentStep == .bluetooth {
-                Image(currentStep.iconName)
-                    .font(.system(size: 40))
-                    .foregroundColor(currentStep.accentColor)
-                    .frame(width: 60, height: 60)
-                    .background(
-                        Circle()
-                            .fill(currentStep.accentColor.opacity(0.2))
-                    )
-            } else {
-                Image(systemName: currentStep.iconName)
-                    .font(.system(size: 40))
-                    .foregroundColor(currentStep.accentColor)
-                    .frame(width: 60, height: 60)
-                    .background(
-                        Circle()
-                            .fill(currentStep.accentColor.opacity(0.2))
-                    )
+            Group {
+                if currentStep == .nightscout {
+                    Image(currentStep.iconName)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 60, height: 60)
+                } else if currentStep == .bluetooth {
+                    Image(currentStep.iconName)
+                        .font(.system(size: 40))
+                        .foregroundColor(currentStep.accentColor)
+                        .frame(width: 60, height: 60)
+                        .background(
+                            Circle()
+                                .fill(currentStep.accentColor.opacity(0.2))
+                        )
+                } else {
+                    Image(systemName: currentStep.iconName)
+                        .font(.system(size: 40))
+                        .foregroundColor(currentStep.accentColor)
+                        .frame(width: 60, height: 60)
+                        .background(
+                            Circle()
+                                .fill(currentStep.accentColor.opacity(0.2))
+                        )
+                }
             }
+            .accessibilityHidden(true)
 
             VStack(alignment: .leading) {
                 Text(currentStep.title)
@@ -445,6 +482,8 @@ struct OnboardingStepContent: View {
             }
         }
         .padding(.horizontal)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -464,13 +503,14 @@ struct OnboardingNavigationButtons: View {
     @Bindable var state: Onboarding.StateModel
     var shouldDisableNextButton: Bool
     var navigationDirectionChanged: (OnboardingNavigationDirection) -> Void
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
 
     var body: some View {
         HStack {
             if currentStep != .welcome {
                 Button(action: {
                     navigationDirectionChanged(.backward)
-                    withAnimation {
+                    withAnimation(reduceMotion ? .easeInOut(duration: 0.25) : .default) {
                         handleBackNavigation()
                     }
                 }) {
@@ -487,7 +527,7 @@ struct OnboardingNavigationButtons: View {
 
             Button(action: {
                 navigationDirectionChanged(.forward)
-                withAnimation {
+                withAnimation(reduceMotion ? .easeInOut(duration: 0.25) : .default) {
                     handleNextNavigation()
                 }
             }) {
@@ -593,14 +633,9 @@ struct OnboardingNavigationButtons: View {
                 currentStep = previousStep
                 currentSMBSubstep = .enableSMBAlways
 
-                switch state.pumpOptionForOnboardingUnits {
-                case .dana,
-                     .minimed:
-                    currentAutosensSubstep = .rewindResetsAutosens
-                case .omnipodDash,
-                     .omnipodEros:
-                    currentAutosensSubstep = .autosensMax
-                }
+                currentAutosensSubstep = state.pumpOptionForOnboardingUnits.reportsRewindEvents
+                    ? .rewindResetsAutosens
+                    : .autosensMax
             }
 
         case .targetBehavior:
@@ -738,6 +773,11 @@ struct OnboardingNavigationButtons: View {
 
         case .notifications:
             currentTargetBehaviorSubstep = .halfBasalTarget
+
+            // AlarmKit is the audible channel for critical alarms on iOS 26+
+            // builds without the Critical Alerts entitlement — it's what lets
+            // them pierce Silent and Focus. No-ops below iOS 26 or once decided.
+            Task { await CriticalAlertAlarmScheduler.requestAuthorization() }
 
             if let next = currentStep.next {
                 state.notificationsManager.getNotificationSettings { notificationSettings in

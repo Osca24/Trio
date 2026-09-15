@@ -135,7 +135,7 @@ struct ForecastChart: View {
                     .lineStyle(.init(lineWidth: 2))
                     .annotation(
                         position: .top,
-                        overflowResolution: .init(x: .fit(to: .chart), y: .disabled)
+                        overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
                     ) {
                         selectionPopover
                     }
@@ -147,11 +147,11 @@ struct ForecastChart: View {
                 .zIndex(-1)
                 .symbolSize(CGSize(width: 15, height: 15))
                 .foregroundStyle(
-                    Decimal(selectedGlucose.glucose) > state.highGlucose ? Color.orange
+                    Decimal(selectedGlucose.glucose) > state.highGlucose ? Color.staticHigh
                         .opacity(0.8) :
                         (
-                            Decimal(selectedGlucose.glucose) < state.lowGlucose ? Color.red.opacity(0.8) : Color.green
-                                .opacity(0.8)
+                            Decimal(selectedGlucose.glucose) < state.lowGlucose ? Color.staticLow.opacity(0.8)
+                                : Color.staticInRange.opacity(0.8)
                         )
                 )
 
@@ -197,6 +197,27 @@ struct ForecastChart: View {
             "zt": Color.zt,
             "cob": Color.orange
         ])
+        // Custom chart VoiceOver cannot explore; give it a spoken summary.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(forecastChartAccessibilityLabel))
+    }
+
+    /// Spoken summary: latest glucose and the forecast eventual glucose.
+    private var forecastChartAccessibilityLabel: String {
+        let unitLabel = state.units == .mgdL ? String(localized: "mg/dL") : String(localized: "mmol/L")
+        func format(_ value: Int) -> String {
+            state.units == .mgdL ? Decimal(value).description : Decimal(value).formattedAsMmolL
+        }
+        var parts = [String(localized: "Glucose and forecast chart", comment: "Accessibility: chart summary")]
+        if let latest = state.latestGlucose {
+            parts.append(String(localized: "latest", comment: "Accessibility") + " \(format(Int(latest.glucose))) \(unitLabel)")
+        }
+        let eventual: Int? = state.simulatedDetermination?.eventualBG
+            ?? state.determination.first?.eventualBG.map { Int(truncating: $0) }
+        if let eventual {
+            parts.append(String(localized: "forecast eventually", comment: "Accessibility") + " \(format(eventual)) \(unitLabel)")
+        }
+        return parts.joined(separator: ", ")
     }
 
     @ViewBuilder var selectionPopover: some View {
@@ -221,12 +242,22 @@ struct ForecastChart: View {
                     glucoseColorScheme: state.glucoseColorScheme
                 )
                 HStack {
-                    Text(state.units == .mgdL ? Decimal(sgv).description : Decimal(sgv).formattedAsMmolL)
+                    Text("CGM: ") + Text(state.units == .mgdL ? Decimal(sgv).description : Decimal(sgv).formattedAsMmolL)
                         .bold()
                         + Text(" \(state.units.rawValue)")
                 }.foregroundStyle(
                     Color(glucoseColor)
                 ).font(.footnote)
+
+                if state.isSmoothingEnabled, let smoothedGlucose = selectedGlucose?.smoothedGlucose {
+                    let smoothedGlucoseToDisplay: Decimal = state.units == .mgdL
+                        ? smoothedGlucose.decimalValue
+                        : smoothedGlucose.decimalValue.asMmolL
+                    HStack {
+                        Image(systemName: "sparkles")
+                        Text(smoothedGlucoseToDisplay.description) + Text(" \(state.units.rawValue)")
+                    }.font(.footnote)
+                }
             }
             .padding(7)
             .background {
@@ -259,24 +290,36 @@ struct ForecastChart: View {
                 glucoseColorScheme: state.glucoseColorScheme
             )
 
-            if !state.isSmoothingEnabled {
-                PointMark(
-                    x: .value("Time", item.date ?? Date(), unit: .second),
-                    y: .value("Value", glucoseToDisplay)
-                )
-                .foregroundStyle(pointMarkColor)
-                .symbolSize(18)
-            } else {
-                PointMark(
-                    x: .value("Time", item.date ?? Date(), unit: .second),
-                    y: .value("Value", glucoseToDisplay)
-                )
-                .symbol {
-                    Image(systemName: "record.circle.fill")
-                        .font(.system(size: 6))
+            PointMark(
+                x: .value("Time", item.date ?? Date(), unit: .second),
+                y: .value("Value", glucoseToDisplay)
+            )
+            .foregroundStyle(pointMarkColor)
+            .symbol {
+                if item.isManual {
+                    Image(systemName: "drop.fill")
+                        .font(.caption2)
+                        .symbolRenderingMode(.monochrome)
+                        .bold()
+                        .foregroundStyle(.red)
+                } else {
+                    Image(systemName: "circle.fill")
+                        .font(.system(size: 4))
                         .bold()
                         .foregroundStyle(pointMarkColor)
                 }
+            }
+
+            if state.isSmoothingEnabled, let smoothedGlucose = item.smoothedGlucose, smoothedGlucose != 0 {
+                let smoothedGlucoseForDisplay: Decimal = state.units == .mgdL
+                    ? smoothedGlucose.decimalValue
+                    : smoothedGlucose.decimalValue.asMmolL
+                LineMark(
+                    x: .value("Time", item.date ?? Date(), unit: .second),
+                    y: .value("Value", smoothedGlucoseForDisplay),
+                    series: .value("Type", "Smoothed")
+                )
+                .foregroundStyle(Color.secondary)
             }
         }
     }

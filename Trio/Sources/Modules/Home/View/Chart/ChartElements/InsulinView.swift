@@ -6,6 +6,7 @@ struct InsulinView: ChartContent {
     let glucoseData: [GlucoseStored]
     let insulinData: [PumpEventStored]
     let units: GlucoseUnits
+    let bolusDisplayThreshold: BolusDisplayThreshold
 
     var body: some ChartContent {
         drawBoluses()
@@ -31,10 +32,18 @@ struct InsulinView: ChartContent {
                 .symbol {
                     Image(systemName: "arrowtriangle.down.fill").font(.system(size: size)).foregroundStyle(Color.insulin)
                 }
+
+                PointMark(
+                    x: .value("Time", bolusDate, unit: .second),
+                    y: .value("Value", yPosition)
+                )
+                .symbolSize(0)
                 .annotation(position: .top) {
-                    Text(Formatter.bolusFormatter.string(from: amount) ?? "")
-                        .font(.caption2)
-                        .foregroundStyle(Color.primary)
+                    if amount as Decimal >= bolusDisplayThreshold.rawValue {
+                        Text(Formatter.bolusFormatter.string(from: amount) ?? "")
+                            .font(.caption2)
+                            .foregroundStyle(Color.primary)
+                    }
                 }
             }
         }

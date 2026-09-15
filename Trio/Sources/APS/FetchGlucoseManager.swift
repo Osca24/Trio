@@ -1,4 +1,5 @@
 import Combine
+import CoreData
 import Foundation
 import HealthKit
 import LoopKit
@@ -18,6 +19,12 @@ protocol FetchGlucoseManager: SourceInfoProvider {
     var cgmGlucosePluginId: String { get }
     var settingsManager: SettingsManager! { get }
     var shouldSyncToRemoteService: Bool { get }
+    var cgmDisplayState: CurrentValueSubject<CgmDisplayState?, Never> { get }
+    var cgmProgressHighlight: CurrentValueSubject<DeviceLifecycleProgress?, Never> { get }
+    /// Routes CGMManager-issued alerts (sensor failure, signal loss, expiry,
+    /// etc.) into the unified `TrioAlertManager` pipeline. Read by
+    /// `PluginSource.issueAlert` / `retractAlert`.
+    var trioAlertManager: TrioAlertManager! { get }
 }
 
 extension FetchGlucoseManager {
@@ -29,15 +36,15 @@ extension FetchGlucoseManager {
 final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
     private let processQueue = DispatchQueue(label: "BaseGlucoseManager.processQueue")
 
+    @Injected() var broadcaster: Broadcaster!
     @Injected() var glucoseStorage: GlucoseStorage!
     @Injected() var nightscoutManager: NightscoutManager!
-    @Injected() var tidepoolService: TidepoolManager!
-    @Injected() var apsManager: APSManager!
     @Injected() var settingsManager: SettingsManager!
     @Injected() var healthKitManager: HealthKitManager!
     @Injected() var deviceDataManager: DeviceDataManager!
     @Injected() var pluginCGMManager: PluginManager!
     @Injected() var calibrationService: CalibrationService!
+    @Injected() var trioAlertManager: TrioAlertManager!
 
     private var lifetime = Lifetime()
     private let timer = DispatchTimer(timeInterval: 1.minutes.timeInterval)
@@ -54,8 +61,6 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
 
     private lazy var simulatorSource = GlucoseSimulatorSource()
 
-    private let context = CoreDataStack.shared.newTaskContext()
-
     /// Enforce mutual exclusion on calls to glucoseStoreAndHeartDecision
     private let glucoseStoreAndHeartLock = DispatchSemaphore(value: 1)
 
@@ -65,6 +70,8 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
         }
         return cgmManager.shouldSyncToRemoteService
     }
+
+    var shouldSmoothGlucose: Bool = false
 
     init(resolver: Resolver) {
         injectServices(resolver)
@@ -76,6 +83,7 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
             cgmGlucoseSourceType: settingsManager.settings.cgm,
             cgmGlucosePluginId: settingsManager.settings.cgmPluginIdentifier
         )
+        shouldSmoothGlucose = settingsManager.settings.smoothGlucose
         subscribe()
     }
 
@@ -117,6 +125,8 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
             .store(in: &lifetime)
         timer.fire()
         timer.resume()
+
+        broadcaster.register(SettingsObserver.self, observer: self)
     }
 
     /// Store new glucose readings from the CGM manager
@@ -141,7 +151,27 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
         }
     }
 
-    var glucoseSource: GlucoseSource?
+    let cgmDisplayState = CurrentValueSubject<CgmDisplayState?, Never>(nil)
+    let cgmProgressHighlight = CurrentValueSubject<DeviceLifecycleProgress?, Never>(nil)
+    private var cgmStatusSubscriptions = Set<AnyCancellable>()
+
+    var glucoseSource: GlucoseSource? {
+        didSet {
+            // Drop prior subscriptions so source swaps don't dupe emissions.
+            cgmStatusSubscriptions.removeAll()
+            cgmDisplayState.value = glucoseSource?.cgmDisplayState.value
+            cgmProgressHighlight.value = glucoseSource?.cgmProgressHighlight.value
+            guard let glucoseSource else { return }
+            glucoseSource.cgmDisplayState
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] state in self?.cgmDisplayState.value = state }
+                .store(in: &cgmStatusSubscriptions)
+            glucoseSource.cgmProgressHighlight
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] progress in self?.cgmProgressHighlight.value = progress }
+                .store(in: &cgmStatusSubscriptions)
+        }
+    }
 
     func removeCalibrations() {
         calibrationService.removeAllCalibrations()
@@ -197,7 +227,6 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
         if let manager = newManager {
             cgmManager = manager
             removeCalibrations()
-//            glucoseSource = nil
         } else if self.cgmGlucoseSourceType == .plugin, cgmManager == nil, let rawCGMManager = rawCGMManager {
             cgmManager = cgmManagerFromRawValue(rawCGMManager)
             updateManagerUnits(cgmManager)
@@ -216,12 +245,14 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
                 glucoseSource = nightscoutManager
             case .simulator:
                 glucoseSource = simulatorSource
-            case .enlite:
-                glucoseSource = deviceDataManager
             case .plugin:
                 glucoseSource = PluginSource(glucoseStorage: glucoseStorage, glucoseManager: self)
             }
         }
+
+        // Only an active plugin CGM with its own BLE connection can wake the app; otherwise the pump must heartbeat
+        let cgmProvidesHeartbeat = cgmGlucoseSourceType == .plugin && (cgmManager?.providesBLEHeartbeat ?? false)
+        deviceDataManager.updateCGMHeartbeatCapability(providesBLEHeartbeat: cgmProvidesHeartbeat)
     }
 
     /// Upload cgmManager from raw value
@@ -232,40 +263,6 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
             return nil
         }
         return Manager.init(rawState: rawState)
-    }
-
-    private func fetchGlucose() async throws -> [GlucoseStored]? {
-        try await CoreDataStack.shared.fetchEntitiesAsync(
-            ofType: GlucoseStored.self,
-            onContext: context,
-            predicate: NSPredicate.predicateFor30MinAgo,
-            key: "date",
-            ascending: false,
-            fetchLimit: 6
-        ) as? [GlucoseStored]
-    }
-
-    private func processGlucose() async throws -> [BloodGlucose] {
-        let results = try await fetchGlucose()
-
-        return try await context.perform {
-            guard let results else {
-                throw CoreDataError.fetchError(function: #function, file: #file)
-            }
-            return results.map { result in
-                BloodGlucose(
-                    sgv: Int(result.glucose),
-                    direction: BloodGlucose.Direction(from: result.direction ?? ""),
-                    date: Decimal(result.date?.timeIntervalSince1970 ?? Date().timeIntervalSince1970) * 1000,
-                    dateString: result.date ?? Date(),
-                    unfiltered: Decimal(result.glucose),
-                    filtered: Decimal(result.glucose),
-                    noise: nil,
-                    glucose: Int(result.glucose),
-                    type: "sgv"
-                )
-            }
-        }
     }
 
     private func glucoseStoreAndHeartDecision(syncDate: Date, glucose: [BloodGlucose]) async throws {
@@ -303,22 +300,23 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
         }
         debug(.deviceManager, "New glucose found")
 
-        // filter the data if it is the case
-        if settingsManager.settings.smoothGlucose {
-            // limited to 30 min of old glucose data
-            let oldGlucoseValues = try await processGlucose()
+        try await glucoseStorage.storeGlucose(filtered)
 
-            var smoothedValues = oldGlucoseValues + filtered
-            // smooth with 3 repeats
-            for _ in 1 ... 3 {
-                smoothedValues.smoothSavitzkyGolayQuaDratic(withFilterWidth: 3)
-            }
-            // find the new values only
-            filtered = smoothedValues.filter { $0.dateString > syncDate }
+        if settingsManager.settings.smoothGlucose {
+            let smoothingContext = CoreDataStack.shared.newTaskContext()
+            smoothingContext.name = "exponentialSmoothingGlucose"
+            await exponentialSmoothingGlucose(context: smoothingContext)
         }
 
-        try await glucoseStorage.storeGlucose(filtered)
+        // Push the fresh reading schedule so the pump can align its BLE heartbeat
+        deviceDataManager.updatePumpBLEHeartbeat(
+            lastCGMReadingDate: filtered.map(\.dateString).max(),
+            expectedCGMReadingInterval: cgmManager?.expectedGlucoseSampleInterval
+        )
+
         deviceDataManager.heartbeat(date: Date())
+
+        TelemetryClient.shared.checkAndSendIfOverdueInBackground()
 
         endBackgroundTaskSafely(&backgroundTaskID, taskName: "Glucose Store and Heartbeat Decision")
     }
@@ -375,5 +373,223 @@ extension CGMManager {
             "managerIdentifier": pluginIdentifier,
             "state": rawState
         ]
+    }
+}
+
+extension BaseFetchGlucoseManager: SettingsObserver {
+    /// Smooth glucose data when smoothing is turned on.
+    func settingsDidChange(_: TrioSettings) {
+        let smoothingWasEnabled = shouldSmoothGlucose
+        let smoothingIsEnabled = settingsManager.settings.smoothGlucose
+        shouldSmoothGlucose = smoothingIsEnabled
+
+        guard smoothingIsEnabled, !smoothingWasEnabled else { return }
+
+        processQueue.async { [weak self] in
+            guard let self else { return }
+
+            self.glucoseStoreAndHeartLock.wait()
+            Task {
+                let context = CoreDataStack.shared.newTaskContext()
+                context.name = "exponentialSmoothingGlucose"
+                await self.exponentialSmoothingGlucose(context: context)
+                self.glucoseStoreAndHeartLock.signal()
+            }
+        }
+    }
+}
+
+extension BaseFetchGlucoseManager {
+    func fetchGlucose(context: NSManagedObjectContext) async throws -> [NSManagedObjectID] {
+        // Compound predicate: time window + non-manual + valid date
+        let timePredicate = NSPredicate.predicateForOneDayAgoInMinutes
+        let manualPredicate = NSPredicate(format: "isManual == NO")
+        let datePredicate = NSPredicate(format: "date != nil")
+
+        let compoundPredicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            timePredicate,
+            manualPredicate,
+            datePredicate
+        ])
+
+        let results = try await CoreDataStack.shared.fetchEntitiesAsync(
+            ofType: GlucoseStored.self,
+            onContext: context,
+            // Predicate must cover at least the full glucose horizon used by downstream algorithm consumers.
+            // If autosens / oref / smoothing logic ever starts looking back further (e.g. 36h),
+            // this fetch window must be expanded accordingly.
+            // Fetch descending (newest first) so the limit always keeps the most recent 350 readings.
+            // Reversed before return so callers receive oldest-first (chronological) order.
+            predicate: compoundPredicate,
+            key: "date",
+            ascending: false,
+            fetchLimit: 350
+        )
+
+        guard let glucoseArray = results as? [GlucoseStored] else {
+            throw CoreDataError.fetchError(function: #function, file: #file)
+        }
+
+        return Array(glucoseArray.map(\.objectID).reversed())
+    }
+
+    /// CoreData-friendly AAPS exponential smoothing + storage.
+    /// - Important: Only stores `smoothedGlucose`. UI/alerts should still use `glucose`.
+    ///
+    func exponentialSmoothingGlucose(context: NSManagedObjectContext) async {
+        let startTime = Date()
+
+        do {
+            // get objectIDs
+            let objectIDs = try await fetchGlucose(context: context)
+
+            try await context.perform {
+                // Load managed objects from object IDs
+                // Filtering (isManual, date) already done at DB level in fetchGlucose
+                let glucoseReadings = objectIDs.compactMap {
+                    context.object(with: $0) as? GlucoseStored
+                }
+
+                guard !glucoseReadings.isEmpty else { return }
+
+                // Static method call to avoid self-capture
+                Self.applyExponentialSmoothingAndStore(
+                    glucoseReadings: glucoseReadings,
+                    minimumWindowSize: 4,
+                    maximumAllowedGapMinutes: 12,
+                    xDripErrorGlucose: 38,
+                    minimumSmoothedGlucose: 39,
+                    firstOrderWeight: 0.4,
+                    firstOrderAlpha: 0.5,
+                    secondOrderAlpha: 0.4,
+                    secondOrderBeta: 1.0
+                )
+
+                try context.save()
+            }
+
+            let duration = Date().timeIntervalSince(startTime)
+            debugPrint(String(format: "Exponential smoothing duration: %0.04fs", duration))
+        } catch {
+            debug(.deviceManager, "Failed to smooth glucose: \(error)")
+        }
+    }
+
+    private static func applyExponentialSmoothingAndStore(
+        glucoseReadings data: [GlucoseStored],
+        minimumWindowSize: Int,
+        maximumAllowedGapMinutes: Int,
+        xDripErrorGlucose: Int,
+        minimumSmoothedGlucose: Decimal,
+        firstOrderWeight: Decimal,
+        firstOrderAlpha: Decimal,
+        secondOrderAlpha: Decimal,
+        secondOrderBeta: Decimal
+    ) {
+        guard !data.isEmpty else { return }
+
+        // Determine the size of the valid most-recent smoothing window.
+        // We walk adjacent pairs from newest -> oldest to preserve the same window semantics
+        // as the original implementation, but avoid manual reverse indexing.
+        var validWindowCount = max(data.count - 1, 0)
+
+        for (recentOffset, pair) in zip(data.dropFirst().reversed(), data.dropLast().reversed()).enumerated() {
+            let (newer, older) = pair
+
+            guard let newerDate = newer.date, let olderDate = older.date else { continue }
+
+            let gapSeconds = newerDate.timeIntervalSince(olderDate)
+            let gapMinutesRounded = Int((gapSeconds / 60.0).rounded())
+
+            if gapMinutesRounded >= maximumAllowedGapMinutes {
+                validWindowCount = recentOffset + 1 // include the more recent reading
+                break
+            }
+
+            // Ported from AAPS: 38 mg/dL may represent an xDrip error state.
+            if Int(newer.glucose) == xDripErrorGlucose {
+                validWindowCount = recentOffset // exclude this 38 value
+                break
+            }
+        }
+
+        // Not enough recent contiguous readings to smooth (e.g. after CGM gap).
+        // IMPORTANT: Only apply fallback to the recent window, not all data.
+        // Otherwise a recent gap would overwrite historical smoothed values.
+        guard validWindowCount >= minimumWindowSize else {
+            let recentWindow = data.suffix(validWindowCount)
+
+            for object in recentWindow {
+                let raw = Decimal(Int(object.glucose))
+                object.smoothedGlucose = max(raw, minimumSmoothedGlucose) as NSDecimalNumber
+            }
+
+            return
+        }
+
+        // Restrict smoothing to the valid most-recent window, still in chronological order.
+        let validWindow = data.suffix(validWindowCount)
+
+        guard let oldest = validWindow.first else { return }
+
+        // ---- 1st order smoothing ----
+        var firstOrderSmoothed: [Decimal] = []
+        firstOrderSmoothed.reserveCapacity(validWindow.count)
+
+        var firstOrderCurrent = Decimal(Int(oldest.glucose))
+        firstOrderSmoothed.append(firstOrderCurrent)
+
+        for sample in validWindow.dropFirst() {
+            let raw = Decimal(Int(sample.glucose))
+            firstOrderCurrent = firstOrderCurrent + firstOrderAlpha * (raw - firstOrderCurrent)
+            firstOrderSmoothed.append(firstOrderCurrent)
+        }
+
+        // ---- 2nd order smoothing ----
+        let secondOrderInput = Array(validWindow)
+        guard secondOrderInput.count >= 2 else { return }
+
+        var secondOrderSmoothed: [Decimal] = []
+        secondOrderSmoothed.reserveCapacity(secondOrderInput.count)
+
+        var secondOrderDeltas: [Decimal] = []
+        secondOrderDeltas.reserveCapacity(secondOrderInput.count)
+
+        var previousSecondOrderSmoothed = Decimal(Int(secondOrderInput[0].glucose))
+        var previousSecondOrderDelta =
+            Decimal(Int(secondOrderInput[1].glucose) - Int(secondOrderInput[0].glucose))
+
+        secondOrderSmoothed.append(previousSecondOrderSmoothed)
+        secondOrderDeltas.append(previousSecondOrderDelta)
+
+        for sample in secondOrderInput.dropFirst() {
+            let raw = Decimal(Int(sample.glucose))
+
+            let nextSmoothed =
+                secondOrderAlpha * raw
+                    + (1 - secondOrderAlpha) * (previousSecondOrderSmoothed + previousSecondOrderDelta)
+
+            let nextDelta =
+                secondOrderBeta * (nextSmoothed - previousSecondOrderSmoothed)
+                    + (1 - secondOrderBeta) * previousSecondOrderDelta
+
+            previousSecondOrderSmoothed = nextSmoothed
+            previousSecondOrderDelta = nextDelta
+
+            secondOrderSmoothed.append(nextSmoothed)
+            secondOrderDeltas.append(nextDelta)
+        }
+
+        // ---- Weighted blend ----
+        let blended = zip(firstOrderSmoothed, secondOrderSmoothed).map { firstOrder, secondOrder in
+            firstOrderWeight * firstOrder + (1 - firstOrderWeight) * secondOrder
+        }
+
+        // Apply to the most recent valid-window readings.
+        for (object, blendedValue) in zip(validWindow, blended) {
+            let rounded = blendedValue.rounded(toPlaces: 0) // nearest integer, ties away from zero
+            let clamped = max(rounded, minimumSmoothedGlucose)
+            object.smoothedGlucose = clamped as NSDecimalNumber
+        }
     }
 }

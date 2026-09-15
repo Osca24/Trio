@@ -66,7 +66,6 @@ struct MealPresetView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         dismiss()
-                        resetValues()
                     } label: {
                         Text("Close")
                     }
@@ -74,7 +73,6 @@ struct MealPresetView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: {
                         showAddNewPresetSheet.toggle()
-                        resetValues()
                     }, label: {
                         HStack {
                             Text("New Preset")
@@ -93,7 +91,7 @@ struct MealPresetView: View {
                     onSave: savePreset,
                     onCancel: {
                         showAddNewPresetSheet.toggle()
-                        resetValues()
+                        resetNewPresetForm()
                     }
                 )
             }
@@ -267,12 +265,15 @@ struct MealPresetView: View {
     }
 
     private func resetValues() {
+        state.selection = nil
+        state.summation.removeAll()
+    }
+
+    private func resetNewPresetForm() {
         dish = ""
         presetCarbs = 0
         presetFat = 0
         presetProtein = 0
-        state.selection = nil
-        state.summation.removeAll()
     }
 
     private var minusButton: some View {
@@ -301,6 +302,7 @@ struct MealPresetView: View {
         label: { Image(systemName: "minus.circle.fill")
             .font(.title3)
         }
+        .accessibilityLabel(Text("Remove one serving"))
         .disabled(
             state
                 .selection == nil ||
@@ -326,6 +328,7 @@ struct MealPresetView: View {
         label: { Image(systemName: "plus.circle.fill")
             .font(.title3)
         }
+        .accessibilityLabel(Text("Add one serving"))
         .disabled(state.selection == nil)
         .buttonStyle(.borderless)
         .tint(.blue)
@@ -345,7 +348,6 @@ struct MealPresetView: View {
                 guard moc.hasChanges else { return }
                 try moc.save()
                 showAddNewPresetSheet.toggle()
-                resetValues()
             } catch let error as NSError {
                 debugPrint("\(DebuggingIdentifiers.failed) Failed to save Meal Preset with error: \(error.userInfo)")
             }

@@ -13,10 +13,15 @@ struct ContactImageEntry: Hashable, Equatable, Sendable {
     var hasHighContrast: Bool = true
     var ringWidth: RingWidth = .regular
     var ringGap: RingGap = .small
+    var colorMode: ColorMode = .color
+    var backgroundMode: BackgroundMode = .transparent
     var fontSize: FontSize = .regular
     var secondaryFontSize: FontSize = .small
     var fontWeight: Font.Weight = .medium
     var fontWidth: Font.Width = .standard
+    // Only used by the Glucose Bobble style.
+    var bobbleShowMinutesAgo: Bool = true
+    var bobbleShowDelta: Bool = true
     var managedObjectID: NSManagedObjectID?
 
     static func == (lhs: ContactImageEntry, rhs: ContactImageEntry) -> Bool {
@@ -31,10 +36,14 @@ struct ContactImageEntry: Hashable, Equatable, Sendable {
             lhs.hasHighContrast == rhs.hasHighContrast &&
             lhs.ringWidth == rhs.ringWidth &&
             lhs.ringGap == rhs.ringGap &&
+            lhs.colorMode == rhs.colorMode &&
+            lhs.backgroundMode == rhs.backgroundMode &&
             lhs.fontSize == rhs.fontSize &&
             lhs.secondaryFontSize == rhs.secondaryFontSize &&
             lhs.fontWeight == rhs.fontWeight &&
-            lhs.fontWidth == rhs.fontWidth
+            lhs.fontWidth == rhs.fontWidth &&
+            lhs.bobbleShowMinutesAgo == rhs.bobbleShowMinutesAgo &&
+            lhs.bobbleShowDelta == rhs.bobbleShowDelta
     }
 
     // Convert `fontWeight` to a String for Core Data storage
@@ -55,6 +64,36 @@ struct ContactImageEntry: Hashable, Equatable, Sendable {
     // Initialize `fontWidth` from a String
     static func fontWidth(from string: String) -> Font.Width {
         Font.Width.fromString(string)
+    }
+
+    enum ColorMode: String, JSON, CaseIterable, Identifiable, Codable {
+        var id: String { rawValue }
+        case color
+        case monochrome
+
+        var displayName: String {
+            switch self {
+            case .color:
+                return String(localized: "Color", comment: "")
+            case .monochrome:
+                return String(localized: "Monochrome", comment: "")
+            }
+        }
+    }
+
+    enum BackgroundMode: String, JSON, CaseIterable, Identifiable, Codable {
+        var id: String { rawValue }
+        case transparent
+        case black
+
+        var displayName: String {
+            switch self {
+            case .transparent:
+                return String(localized: "Transparent", comment: "")
+            case .black:
+                return String(localized: "Black", comment: "")
+            }
+        }
     }
 
     enum FontSize: Int, Codable, Sendable, CaseIterable {
@@ -155,6 +194,7 @@ enum ContactImageLayout: String, JSON, CaseIterable, Identifiable, Codable {
     var id: String { rawValue }
     case `default`
     case split
+    case bobble
 
     var displayName: String {
         switch self {
@@ -162,6 +202,8 @@ enum ContactImageLayout: String, JSON, CaseIterable, Identifiable, Codable {
             return String(localized: "Default", comment: "")
         case .split:
             return String(localized: "Split", comment: "")
+        case .bobble:
+            return String(localized: "Glucose Bobble", comment: "")
         }
     }
 }

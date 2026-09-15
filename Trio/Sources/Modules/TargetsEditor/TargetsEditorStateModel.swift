@@ -3,6 +3,7 @@ import SwiftUI
 extension TargetsEditor {
     final class StateModel: BaseStateModel<Provider> {
         @Injected() private var nightscout: NightscoutManager!
+        @Injected() private var tidepoolManager: TidepoolManager!
         @Injected() private var broadcaster: Broadcaster!
 
         @Published var items: [Item] = []
@@ -55,8 +56,8 @@ extension TargetsEditor {
 
             items = profile.targets.map { value in
                 let timeIndex = timeValues.firstIndex(of: Double(value.offset * 60)) ?? 0
-                let lowIndex = rateValues.firstIndex(of: value.low) ?? 0
-                let highIndex = rateValues.firstIndex(of: value.high) ?? 0
+                let lowIndex = resolveRateIndex(rate: value.low) ?? 0
+                let highIndex = resolveRateIndex(rate: value.high) ?? 0
                 return Item(lowIndex: lowIndex, highIndex: highIndex, timeIndex: timeIndex)
             }
 
@@ -113,6 +114,10 @@ extension TargetsEditor {
                     )
                 }
             }
+
+            Task.detached(priority: .low) {
+                await self.tidepoolManager.uploadSettings()
+            }
         }
 
         func validate() {
@@ -129,6 +134,19 @@ extension TargetsEditor {
                     self.units = self.settingsManager.settings.units
                 }
             }
+        }
+
+        func resolveRateIndex(rate: Decimal) -> Int? {
+            if let index = rateValues.firstIndex(of: rate) {
+                return index
+            }
+            if let min = rateValues.first, let max = rateValues.last {
+                if rate >= (min - 1), rate <= (max + 1) {
+                    return rateValues.findClosestIndex(to: rate)
+                }
+            }
+
+            return nil
         }
     }
 }

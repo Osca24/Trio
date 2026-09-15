@@ -16,19 +16,20 @@ enum Screen: Identifiable, Hashable {
     case crEditor
     case targetsEditor
     case treatmentView
-    case manualTempBasal
-    case dataTable
+    case history
     case cgm
     case healthkit
-    case glucoseNotificationSettings
+    case glucoseAlerts
+    case deviceAlarms
+    case alarmWindows
     case mealSettings
     case iconConfig
     case overrideConfig
-    case snooze
     case statistics
     case watch
     case userInterfaceSettings
     case bolusCalculatorConfig
+    case quickPickTreatmentsConfig
     case dynamicISF
     case calibrations
     case shortcutsConfig
@@ -49,6 +50,8 @@ enum Screen: Identifiable, Hashable {
     case algorithmAdvancedSettings
     case unitsAndLimits
     case appDiagnostics
+    case settingsExport
+    case treatmentsSettings
 
     var id: Int { String(reflecting: self).hashValue }
 }
@@ -92,10 +95,8 @@ extension Screen {
             TargetsEditor.RootView(resolver: resolver)
         case .treatmentView:
             Treatments.RootView(resolver: resolver)
-        case .manualTempBasal:
-            ManualTempBasal.RootView(resolver: resolver)
-        case .dataTable:
-            DataTable.RootView(resolver: resolver)
+        case .history:
+            History.RootView(resolver: resolver)
         case .cgm:
             CGMSettings.RootView(
                 resolver: resolver,
@@ -104,16 +105,18 @@ extension Screen {
             )
         case .healthkit:
             AppleHealthKit.RootView(resolver: resolver)
-        case .glucoseNotificationSettings:
-            GlucoseNotificationSettings.RootView(resolver: resolver)
+        case .glucoseAlerts:
+            GlucoseAlerts.RootView(resolver: resolver)
+        case .deviceAlarms:
+            DeviceAlarms.RootView(resolver: resolver)
+        case .alarmWindows:
+            AlarmWindows.RootView(resolver: resolver)
         case .mealSettings:
             MealSettings.RootView(resolver: resolver)
         case .iconConfig:
             IconConfig.RootView(resolver: resolver)
         case .overrideConfig:
             Adjustments.RootView(resolver: resolver)
-        case .snooze:
-            Snooze.RootView(resolver: resolver)
         case .watch:
             WatchConfig.RootView(resolver: resolver)
         case .statistics:
@@ -122,6 +125,8 @@ extension Screen {
             UserInterfaceSettings.RootView(resolver: resolver)
         case .bolusCalculatorConfig:
             BolusCalculatorConfig.RootView(resolver: resolver)
+        case .quickPickTreatmentsConfig:
+            QuickPickTreatmentsConfig.RootView(resolver: resolver)
         case .dynamicISF:
             DynamicSettings.RootView(resolver: resolver)
         case .calibrations:
@@ -162,6 +167,10 @@ extension Screen {
             UnitsLimitsSettings.RootView(resolver: resolver)
         case .appDiagnostics:
             AppDiagnostics.RootView(resolver: resolver)
+        case .settingsExport:
+            SettingsExport.RootView(resolver: resolver)
+        case .treatmentsSettings:
+            TreatmentsSettingsView(resolver: resolver, state: Settings.StateModel())
         }
     }
 

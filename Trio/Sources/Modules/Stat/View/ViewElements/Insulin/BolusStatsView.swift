@@ -87,6 +87,7 @@ struct BolusStatsView: View {
                 }
             }
             .font(.headline)
+            .accessibilityElement(children: .combine)
 
             Spacer()
 
@@ -272,9 +273,9 @@ struct BolusStatsView: View {
                             AxisGridLine()
                         }
                     case .total:
-                        // Only show every other month
+                        // Show start of every month
                         let day = Calendar.current.component(.day, from: date)
-                        if day == 1 && Calendar.current.component(.month, from: date) % 2 == 1 {
+                        if day == 1 {
                             AxisValueLabel(format: StatChartUtils.dateFormat(for: selectedInterval), centered: true)
                                 .font(.footnote)
                             AxisGridLine()
@@ -303,6 +304,8 @@ struct BolusStatsView: View {
         )
         .chartXVisibleDomain(length: StatChartUtils.visibleDomainLength(for: selectedInterval))
         .frame(height: 280)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("Bolus insulin bar chart"))
     }
 }
 

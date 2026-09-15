@@ -39,20 +39,25 @@ extension LiveActivityAttributes.ContentState {
 
     static func calculateChange(chart: [GlucoseData], units: GlucoseUnits) -> String {
         guard chart.count > 2 else { return "" }
-        let lastGlucose = chart.first?.glucose ?? 0
-        let secondLastGlucose = chart.dropFirst().first?.glucose ?? 0
-        let delta = lastGlucose - secondLastGlucose
-        let deltaAsDecimal = units == .mmolL ? Decimal(delta).asMmolL : Decimal(delta)
+
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
         formatter.maximumFractionDigits = 1
+        formatter.positivePrefix = "  +"
+        formatter.negativePrefix = "  -"
+
+        var lastGlucose = Decimal(chart.first?.glucose ?? 0)
+        var secondLastGlucose = Decimal(chart.dropFirst().first?.glucose ?? 0)
         if units == .mmolL {
+            lastGlucose = lastGlucose.asMmolL
+            secondLastGlucose = secondLastGlucose.asMmolL
+
             formatter.minimumFractionDigits = 1
             formatter.maximumFractionDigits = 1
         }
-        formatter.positivePrefix = "  +"
-        formatter.negativePrefix = "  -"
-        return formatter.string(from: deltaAsDecimal as NSNumber) ?? "--"
+
+        let delta = lastGlucose - secondLastGlucose
+        return formatter.string(from: delta as NSNumber) ?? "--"
     }
 
     init(
@@ -64,6 +69,7 @@ extension LiveActivityAttributes.ContentState {
         determination: DeterminationData?,
         iob: Decimal?,
         override: OverrideData?,
+        tempTarget: TempTargetData?,
         widgetItems: [LiveActivityAttributes.LiveActivityItem]?
     ) {
         let glucose = bg.glucose
@@ -107,7 +113,21 @@ extension LiveActivityAttributes.ContentState {
             overrideDate: override?.date ?? Date(),
             overrideDuration: override?.duration ?? 0,
             overrideTarget: override?.target ?? 0,
-            widgetItems: widgetItems ?? [] // set empty array here to silence compiler; this can never be nil
+            isTempTargetActive: tempTarget?.isActive ?? false,
+            tempTargetName: tempTarget?.tempTargetName ?? "Temp Target",
+            tempTargetDate: tempTarget?.date ?? Date(),
+            tempTargetDuration: tempTarget?.duration ?? 0,
+            tempTargetTarget: tempTarget?.target ?? 0,
+            widgetItems: widgetItems ?? [], // set empty array here to silence compiler; this can never be nil
+            minForecast: settings.displayGlucoseForecasts && settings.forecastDisplayType == .cone
+                ? (determination?.minForecast ?? []) : [],
+            maxForecast: settings.displayGlucoseForecasts && settings.forecastDisplayType == .cone
+                ? (determination?.maxForecast ?? []) : [],
+            forecastLines: settings.displayGlucoseForecasts && settings.forecastDisplayType == .lines
+                ? (determination?.forecastLines ?? [])
+                .map { LiveActivityAttributes.ForecastLine(type: $0.type, values: $0.values) }
+                : [],
+            forecastDisplayType: settings.forecastDisplayType.rawValue
         )
 
         self.init(

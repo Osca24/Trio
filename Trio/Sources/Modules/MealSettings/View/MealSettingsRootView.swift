@@ -59,9 +59,18 @@ extension MealSettings {
                                         Text(" g").foregroundColor(.secondary)
                                     }
                                 }
+                                .contentShape(Rectangle())
                                 .onTapGesture {
                                     displayPickerMaxCarbs.toggle()
                                 }
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel(Text("Max Carbs"))
+                                .accessibilityValue(Text(
+                                    state.maxCarbs.description + " "
+                                        + String(localized: "grams", comment: "Gram unit, spoken")
+                                ))
+                                .accessibilityAddTraits(.isButton)
+                                .accessibilityAction { displayPickerMaxCarbs.toggle() }
                             }.padding(.top)
 
                             if displayPickerMaxCarbs {
@@ -81,26 +90,35 @@ extension MealSettings {
                             if state.useFPUconversion {
                                 VStack {
                                     HStack {
-                                        Text("Max Protein")
+                                        Text("Max Fat")
 
                                         Spacer()
 
                                         Group {
-                                            Text(state.maxProtein.description)
-                                                .foregroundColor(!displayPickerMaxProtein ? .primary : .accentColor)
+                                            Text(state.maxFat.description)
+                                                .foregroundColor(!displayPickerMaxFat ? .primary : .accentColor)
 
                                             Text(" g").foregroundColor(.secondary)
                                         }
                                     }
+                                    .contentShape(Rectangle())
                                     .onTapGesture {
-                                        displayPickerMaxProtein.toggle()
+                                        displayPickerMaxFat.toggle()
                                     }
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel(Text("Max Fat"))
+                                    .accessibilityValue(Text(
+                                        state.maxFat.description + " "
+                                            + String(localized: "grams", comment: "Gram unit, spoken")
+                                    ))
+                                    .accessibilityAddTraits(.isButton)
+                                    .accessibilityAction { displayPickerMaxFat.toggle() }
                                 }
                                 .padding(.top)
 
-                                if displayPickerMaxProtein {
-                                    let setting = PickerSettingsProvider.shared.settings.maxProtein
-                                    Picker(selection: $state.maxProtein, label: Text("")) {
+                                if displayPickerMaxFat {
+                                    let setting = PickerSettingsProvider.shared.settings.maxFat
+                                    Picker(selection: $state.maxFat, label: Text("")) {
                                         ForEach(
                                             PickerSettingsProvider.shared.generatePickerValues(from: setting, units: state.units),
                                             id: \.self
@@ -114,26 +132,35 @@ extension MealSettings {
 
                                 VStack {
                                     HStack {
-                                        Text("Max Fat")
+                                        Text("Max Protein")
 
                                         Spacer()
 
                                         Group {
-                                            Text(state.maxFat.description)
-                                                .foregroundColor(!displayPickerMaxFat ? .primary : .accentColor)
+                                            Text(state.maxProtein.description)
+                                                .foregroundColor(!displayPickerMaxProtein ? .primary : .accentColor)
 
                                             Text(" g").foregroundColor(.secondary)
                                         }
                                     }
+                                    .contentShape(Rectangle())
                                     .onTapGesture {
-                                        displayPickerMaxFat.toggle()
+                                        displayPickerMaxProtein.toggle()
                                     }
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel(Text("Max Protein"))
+                                    .accessibilityValue(Text(
+                                        state.maxProtein.description + " "
+                                            + String(localized: "grams", comment: "Gram unit, spoken")
+                                    ))
+                                    .accessibilityAddTraits(.isButton)
+                                    .accessibilityAction { displayPickerMaxProtein.toggle() }
                                 }
                                 .padding(.top)
 
-                                if displayPickerMaxFat {
-                                    let setting = PickerSettingsProvider.shared.settings.maxFat
-                                    Picker(selection: $state.maxFat, label: Text("")) {
+                                if displayPickerMaxProtein {
+                                    let setting = PickerSettingsProvider.shared.settings.maxProtein
+                                    Picker(selection: $state.maxProtein, label: Text("")) {
                                         ForEach(
                                             PickerSettingsProvider.shared.generatePickerValues(from: setting, units: state.units),
                                             id: \.self
@@ -173,7 +200,7 @@ extension MealSettings {
                                     },
                                     label: {
                                         HStack {
-                                            Image(systemName: "questionmark.circle")
+                                            Image(systemName: "questionmark.circle").accessibilityLabel(Text("More information"))
                                         }
                                     }
                                 ).buttonStyle(BorderlessButtonStyle())
@@ -203,7 +230,7 @@ extension MealSettings {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Default: 6 hours").bold()
                         Text(
-                            "Carb entries will be fully decayed by the number of hours specified as Max Meal Absorption Time. Meals that are high in fat and/or protein can have long lasting effects on BG levels. To allow such late meal effects to be considered by the carb decay model, a longer Max Meal Absorption Time than the default 6 hours can be set."
+                            "Carb entries will be fully decayed by the number of hours specified as Max Meal Absorption Time. Meals that are high in fat and/or protein can have long lasting effects on glucose levels. To allow such late meal effects to be considered by the carb decay model, a longer Max Meal Absorption Time than the default 6 hours can be set."
                         )
                         Text(
                             "If carb entries decay too slowly, it is possible to set a lower than default setting. But this should typically be adressed by tuning ISF and CR settings instead, which in combination determines the rate of carb decay."
@@ -258,7 +285,6 @@ extension MealSettings {
                                     "You can personalize the conversion calculation by adjusting the following settings that will appear when this option is enabled:"
                                 )
                                 Text("• Fat and Protein Delay")
-                                Text("• Maximum Duration")
                                 Text("• Spread Interval")
                                 Text("• Fat and Protein Percentage")
                             }
@@ -295,35 +321,6 @@ extension MealSettings {
                     )
 
                     SettingInputSection(
-                        decimalValue: $state.timeCap,
-                        booleanValue: $booleanPlaceholder,
-                        shouldDisplayHint: $shouldDisplayHint,
-                        selectedVerboseHint: Binding(
-                            get: { selectedVerboseHint },
-                            set: {
-                                selectedVerboseHint = $0.map { AnyView($0) }
-                                hintLabel = String(localized: "Maximum Duration")
-                            }
-                        ),
-                        units: state.units,
-                        type: .decimal("timeCap"),
-                        label: String(localized: "Maximum Duration"),
-                        miniHint: String(localized: "Set the maximum timeframe to extend FPUs."),
-                        verboseHint:
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Default: 8 hours").bold()
-                            Text(
-                                "This sets the maximum length of time that Fat and Protein Carb Equivalents (FPUs) will be extended over from a single Fat and/or Protein bolus calcultor entry."
-                            )
-                            Text(
-                                "It is one factor used in combination with the Fat and Protein Delay, Spread Interval, and Fat and Protein Factor to create the FPU entries."
-                            )
-                            Text("Increasing this setting may result in more FPU entries with smaller carb values.")
-                            Text("Decreasing this setting may result in fewer FPU entries with larger carb values.")
-                        }
-                    )
-
-                    SettingInputSection(
                         decimalValue: $state.minuteInterval,
                         booleanValue: $booleanPlaceholder,
                         shouldDisplayHint: $shouldDisplayHint,
@@ -344,9 +341,9 @@ extension MealSettings {
                             Text(
                                 "This determines how many minutes will be between individual Fat-Protein Unit Carb Equivalent (FPU) entries from a single Fat and/or Protein bolus calculator entry."
                             )
-                            Text("The shorter the interval, the smoother the correlating dosing result.")
-                            Text("Increasing this setting may result in fewer FPU entries with larger carb values.")
-                            Text("Decreasing this setting may result in more FPU entries with smaller carb values.")
+                            Text(
+                                "Entries are capped at 33 grams each, with up to three entries, for a max total of 99 grams."
+                            )
                         }
                     )
 
@@ -401,6 +398,7 @@ extension MealSettings {
             .onAppear(perform: configureView)
             .navigationBarTitle("Meal Settings")
             .navigationBarTitleDisplayMode(.automatic)
+            .settingsHighlightScroll()
         }
     }
 }
